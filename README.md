@@ -14,7 +14,9 @@ pre-aligned to IMGT Vicugna IGHV germlines
           │
           ▼
   bam_extract.py              Step 1 — alignment filter, FR1/J4 anchor extraction,
-                              ANARCI CDR annotation, quality filtering
+                              batched ANARCI CDR annotation, quality filtering;
+                              parallel BAM processing (--workers) + optional GPU
+                              Q-score batching via CuPy (--gpu)
                               → *_vhh_protein_cdr.csv  (unique proteins + read Counts)
           │
           ▼
@@ -96,9 +98,15 @@ Extracts VHH sequences from BAM files aligned to IMGT Vicugna germlines.
 | `--fr1` | CAGGTGCAGCTG | FR1 anchor motif |
 | `--j4` | ACCCAGGTCACC | J4 anchor motif |
 | `--fr-mm` | 2 | Fuzzy mismatch tolerance |
+| `--workers` | 1 | Parallel BAM workers; each BAM runs in its own subprocess |
+| `--gpu` | off | GPU Q-score batching via CuPy (`pip install cupy-cuda11x`) |
 
 ```bash
-python bam_extract.py /path/to/bams/ --min-q 12
+# Single BAM directory, 4 parallel workers
+python bam_extract.py /path/to/bams/ --min-q 12 --workers 4
+
+# GPU-accelerated Q-score batching (requires CuPy)
+python bam_extract.py /path/to/bams/ --min-q 12 --workers 4 --gpu
 ```
 
 ---

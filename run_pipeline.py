@@ -52,34 +52,14 @@ def run_extraction(args):
         "USE_UMI":           args.use_umi,
     }
 
-    bam_files = sorted(input_dir.glob("*.bam"))
+    bam_files = list(input_dir.glob("*.bam"))
     if not bam_files:
         console.print(f"[red]No .bam files found in {input_dir}[/red]")
         sys.exit(1)
 
-    use_gpu = getattr(args, "gpu", False)
-    n_workers = min(getattr(args, "workers", 1), len(bam_files))
-
-    if n_workers == 1:
-        for bam in bam_files:
-            process_bam(bam, output_dir, config, use_gpu=use_gpu)
-    else:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        from bam_extract import _bam_worker
-        from tqdm import tqdm
-        worker_args = [(bam, output_dir, config, use_gpu) for bam in bam_files]
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = {executor.submit(_bam_worker, arg): arg[0].name for arg in worker_args}
-            with tqdm(total=len(futures), desc="BAM files", unit="bam") as pbar:
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        console.print(f"[red]ERROR: {exc}[/red]")
-                    pbar.update(1)
-
     protein_cdr_files = []
     for bam in bam_files:
+        summary = process_bam(bam, output_dir, config)
         pf = input_dir / f"{bam.stem}_vhh_protein_cdr.csv"
         if pf.exists():
             protein_cdr_files.append(pf)
@@ -147,10 +127,6 @@ def main():
     p.add_argument("--min-aa",   type=int,   default=100)
     p.add_argument("--cdr-method", default="anarci", choices=["anarci", "offset"])
     p.add_argument("--use-umi",  action="store_true")
-    p.add_argument("--workers",  type=int, default=1,
-                   help="Parallel BAM workers for Step 1 (default: 1)")
-    p.add_argument("--gpu",      action="store_true",
-                   help="GPU Q-score batching via CuPy in Step 1")
 
     # ── Clustering ────────────────────────────────────────────────────────────
     p.add_argument("--threshold",        type=float, default=0.85,

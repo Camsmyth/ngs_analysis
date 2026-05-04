@@ -10,9 +10,10 @@ Processes Dorado-basecalled BAM files through CDR extraction, sequence clusterin
 
 ```
 BAM files (Dorado/PromethION)
+aligned to IMGT Vicugna germlines
         │
         ▼
-  bam_extract.py          ← primer search, quality filter, CDR annotation
+  bam_extract.py          ← alignment filter, FR1/J4 anchor extraction, CDR annotation
         │
         ▼
   cluster_blosum.py       ← BLOSUM62 hierarchical clustering   ┐
@@ -65,7 +66,13 @@ All Python dependencies are installed automatically by `setup.sh`.
 ## Scripts
 
 ### `bam_extract.py`
-Extracts VHH sequences from BAM files. Key options:
+Extracts VHH sequences from BAM files aligned to IMGT Vicugna germlines.
+
+Uses the alignment as a pre-filter (mapped reads only), then locates the VHH
+coding region using conserved framework motifs — FR1 start (`CAGGTGCAGCTG`) and
+J4 end (`ACCCAGGTCACC`) — rather than PCR primer sequences. This makes extraction
+robust to variation in library prep primers and recovers sequences regardless of
+which strand the aligner placed the read on.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -74,13 +81,17 @@ Extracts VHH sequences from BAM files. Key options:
 | `--max-len` | 1000 | Maximum read length (bp) |
 | `--cdr-method` | anarci | CDR extraction: `anarci` or `offset` |
 | `--use-umi` | off | Enable UMI deduplication (Dorado `UX` tag) |
-| `--max-mm` | 1 | Fuzzy primer mismatch tolerance |
-| `--vhh-f` | CAGGTACAGCTGCA | Forward primer |
-| `--vhh-r` | CGGTGTCTAGCACT | Reverse primer |
+| `--fr1` | CAGGTGCAGCTG | FR1 anchor motif |
+| `--j4` | ACCCAGGTCACC | J4 anchor motif |
+| `--fr-mm` | 2 | Fuzzy mismatch tolerance for framework motifs |
 
 ```bash
 python bam_extract.py /path/to/bams --min-q 12 --cdr-method anarci
 ```
+
+> **Note:** BAM files must be aligned to the IMGT Vicugna VHH germline database
+> before running this script (e.g. with `minimap2` or `bwa`). Unaligned BAMs will
+> yield ~5% recovery at best.
 
 ### `cluster_blosum.py`
 BLOSUM62 hierarchical clustering of CDR3 sequences.
@@ -170,6 +181,7 @@ ngs_analysis/
 
 ## Upstream notes (Dorado / pre-pipeline)
 
+- Align BAM files to the IMGT Vicugna IGHV germline FASTA before running `bam_extract.py`; `minimap2 -ax map-ont` works well for ONT reads
 - Use `--no-trim` in Dorado if VHH primers are part of the amplicon
 - Use HAC or SUP basecalling model (`dna_r10.4.1_e8.2_400bps_hac@v4.3` minimum)
 - Add dual UMIs in library prep for accurate PCR deduplication — enable with `--use-umi`

@@ -2,27 +2,25 @@
 """
 bam_extract.py — Step 1 of the VHH NGS pipeline.
 
-Redesigned for Oxford Nanopore (PromethION) BAM files from Dorado basecalling
-with alpaca VHH genome alignment. Key improvements over original:
+Extracts VHH sequences from ONT BAM files aligned to IMGT Vicugna germlines.
+Uses alignment as a pre-filter (mapped reads only), then anchors extraction
+to conserved VHH framework motifs (FR1 start, J4 end) rather than PCR primer
+sequences — making it robust to variation in library prep primers.
 
-  • ONT-aware quality filtering (Q-score, min read length)
-  • Both forward AND reverse-complement primer search (strand-agnostic)
-  • ANARCI-based CDR annotation using IMGT numbering (replaces fixed-offset slicing)
+  • Alignment pre-filter: skips ~5% unmapped reads immediately
+  • FR1/J4 anchor extraction: strand-agnostic, primer-independent
+  • ANARCI-based CDR annotation using IMGT numbering
+  • ONT-aware quality filtering (Q-score, min/max read length)
   • UMI-based deduplication (if UMI tags present in BAM)
-  • Per-read quality metrics exported for QC
   • PTM / liability site flagging (Asn-glycosylation, free Cys, deamidation)
   • Rich progress display and structured JSON summary
-  • Configurable via CLI flags or config dict
 """
 
 import pysam
 import regex as re
 import csv
 import json
-import os
 import shutil
-import time
-import logging
 import argparse
 from collections import defaultdict, Counter
 from pathlib import Path
@@ -37,7 +35,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ── Try to import ANARCI for numbered CDR extraction ──────────────────────────
 try:
     from anarci import anarci
     ANARCI_AVAILABLE = True
@@ -47,38 +44,35 @@ except ImportError:
 console = Console()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DEFAULT CONFIGURATION  (override via CLI or pass config dict to process_bam)
+# DEFAULT CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 DEFAULT_CONFIG = {
-    # Primer sequences (alpaca VHH amplicon)
-    "VHH_F": "CAGGTACAGCTGCA",
-    "VHH_R": "CGGTGTCTAGCACT",
-
-    # Fuzzy matching
-    "MAX_MISMATCHES": 1,
+    # VHH framework anchor motifs (primer-independent)
+    # FR1: conserved camelid VHH framework 1 start (covers QVQL/EVQL/DVQL)
+    # J4:  conserved J-region end (WGQGTQVTVSS)
+    "FR1_MOTIF": "CAGGTGCAGCTG",
+    "J4_MOTIF":  "ACCCAGGTCACC",
+    "FR_MAX_MISMATCHES": 2,
 
     # ONT read quality gates
-    "MIN_READ_LENGTH": 300,        # bp — discard very short reads
-    "MAX_READ_LENGTH": 1000,       # bp — discard chimeric/concatenated reads
-    "MIN_MEAN_QSCORE": 10.0,       # Phred Q-score threshold (Q10 = 90% acc)
+    "MIN_READ_LENGTH": 300,
+    "MAX_READ_LENGTH": 1000,
+    "MIN_MEAN_QSCORE": 10.0,
 
     # VHH protein quality gates
-    "MIN_VHH_AA_LENGTH": 100,      # minimum translated VHH length
-    "MAX_INTERNAL_STOPS": 0,       # tolerated internal stop codons
+    "MIN_VHH_AA_LENGTH": 100,
+    "MAX_INTERNAL_STOPS": 0,
 
     # CDR extraction method: "anarci" (preferred) or "offset" (fallback)
     "CDR_METHOD": "anarci",
 
     # UMI deduplication
-    "USE_UMI": False,              # set True if UMI tags present (umi:Z: in BAM)
-    "UMI_TAG": "UX",               # BAM tag for UMI (Dorado: UX; custom: MI)
+    "USE_UMI": False,
+    "UMI_TAG": "UX",
 
-    # Output
-    "PROGRESS_UPDATE_INTERVAL": 3,
     "EXPORT_QC_METRICS": True,
 }
 
-# ── Liability motifs to flag ───────────────────────────────────────────────────
 LIABILITY_PATTERNS = {
     "N-glycosylation":  re.compile(r"N[^P][ST]"),
     "Deamidation (NG)": re.compile(r"NG"),
@@ -93,7 +87,6 @@ LIABILITY_PATTERNS = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 def mean_qscore(qualities) -> float:
-    """Convert Phred quality array to mean Q-score (error-probability space)."""
     if qualities is None or len(qualities) == 0:
         return 0.0
     error_probs = [10 ** (-q / 10) for q in qualities]
@@ -101,8 +94,7 @@ def mean_qscore(qualities) -> float:
     return -10 * np.log10(mean_err) if mean_err > 0 else 40.0
 
 
-def fuzzy_search(pattern: str, sequence: str, max_mismatches: int = 1):
-    """Fuzzy regex search; returns (start, end) or None."""
+def fuzzy_search(pattern: str, sequence: str, max_mismatches: int):
     m = re.search(f"({pattern}){{e<={max_mismatches}}}", sequence)
     return (m.start(), m.end()) if m else None
 
@@ -111,51 +103,25 @@ def reverse_complement(seq: str) -> str:
     return str(Seq(seq).reverse_complement())
 
 
-def find_primers_both_strands(seq: str, fwd: str, rev: str, max_mm: int):
+def find_vhh_boundaries(seq: str, fr1: str, j4: str, max_mm: int) -> Optional[Tuple[str, str]]:
     """
-    Search for primer pair on both orientations.
-    Returns (start, end, orientation) or None.
-    Orientation: '+' means fwd primer leads; '-' means found on RC strand.
+    Locate the VHH coding region using conserved framework anchors.
+
+    Searches both the read and its reverse complement. Returns
+    (amplicon_dna, strand) where strand is '+' or '-', or None if not found.
+    The amplicon runs from the FR1 start codon through the end of the J4 motif.
     """
-    # Forward orientation
-    fwd_m = fuzzy_search(fwd, seq, max_mm)
-    rev_m = fuzzy_search(rev, seq, max_mm)
-    if fwd_m and rev_m and rev_m[1] > fwd_m[0]:
-        return fwd_m[0], rev_m[1], "+"
-
-    # Try reverse-complement orientation (ONT reads are strand-random)
-    rc_seq = reverse_complement(seq)
-    fwd_m2 = fuzzy_search(fwd, rc_seq, max_mm)
-    rev_m2 = fuzzy_search(rev, rc_seq, max_mm)
-    if fwd_m2 and rev_m2 and rev_m2[1] > fwd_m2[0]:
-        return fwd_m2[0], rev_m2[1], "-"
-
+    for s, strand in [(seq, "+"), (reverse_complement(seq), "-")]:
+        fr1_m = fuzzy_search(fr1, s, max_mm)
+        j4_m  = fuzzy_search(j4,  s, max_mm)
+        if fr1_m and j4_m and j4_m[1] > fr1_m[0]:
+            return s[fr1_m[0]:j4_m[1]], strand
     return None
 
 
-def mask_indels(sequence: str, read) -> Tuple[str, bool]:
-    """Mask insertions and mark deletions as N using CIGAR string."""
-    if read.cigartuples is None:
-        return sequence, False
-    masked_seq, seq_pos, was_masked = [], 0, False
-    for op, length in read.cigartuples:
-        if op == 0:   # M
-            masked_seq.extend(sequence[seq_pos:seq_pos + length])
-            seq_pos += length
-        elif op == 1: # I
-            seq_pos += length
-            was_masked = True
-        elif op == 2: # D
-            masked_seq.extend(["N"] * length)
-            was_masked = True
-        elif op in (4, 5):  # S/H clips
-            seq_pos += length
-    return "".join(masked_seq), was_masked
-
-
 def detect_and_correct_frameshift(dna_seq: str) -> str:
-    """Try all three frames; return best VHH protein (starts with known VHH motif or longest valid)."""
-    VHH_START_MOTIFS = ("QVQ", "VQL", "QLQ", "EVQ", "DVQ")  # expanded motif list
+    """Try all three frames; return the VHH protein with a recognised FR1 start."""
+    VHH_START_MOTIFS = ("QVQ", "VQL", "QLQ", "EVQ", "DVQ")
     best_prot = ""
     for frame in range(3):
         trimmed = dna_seq[frame:]
@@ -174,14 +140,10 @@ def detect_and_correct_frameshift(dna_seq: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CDR EXTRACTION — two backends
+# CDR EXTRACTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_cdrs_anarci(protein: str) -> Tuple[str, str, str]:
-    """
-    Use ANARCI with IMGT numbering to extract CDR1 (27–38), CDR2 (56–65),
-    CDR3 (105–117) for VHH sequences. Returns ("","","") on failure.
-    """
     if not ANARCI_AVAILABLE:
         return extract_cdrs_offset(protein)
     try:
@@ -194,11 +156,7 @@ def extract_cdrs_anarci(protein: str) -> Tuple[str, str, str]:
         if not results or not results[0]:
             return ("", "", "")
         numbering, _, _ = results[0][0][0]
-
-        # Build position→AA dict
         pos_aa = {num: aa for (num, _), aa in numbering if aa != "-"}
-
-        # IMGT CDR definitions for VHH (nanobody heavy chain)
         cdr1 = "".join(pos_aa.get(i, "") for i in range(27, 39))
         cdr2 = "".join(pos_aa.get(i, "") for i in range(56, 66))
         cdr3 = "".join(pos_aa.get(i, "") for i in range(105, 118))
@@ -208,15 +166,10 @@ def extract_cdrs_anarci(protein: str) -> Tuple[str, str, str]:
 
 
 def extract_cdrs_offset(protein: str) -> Tuple[str, str, str]:
-    """
-    Fallback fixed-offset CDR extraction.
-    Improved CDR3 trimming: searches for conserved WGxG motif.
-    """
     try:
         cdr1 = protein[26:34]
         cdr2 = protein[50:60]
         raw_cdr3 = protein[99:122]
-        # Trim CDR3 at WGxG (conserved VHH framework 4 boundary)
         m = re.search(r"W[GA][QKR]G", raw_cdr3)
         cdr3 = raw_cdr3[:m.start()] if m else raw_cdr3
         return cdr1, cdr2, cdr3
@@ -231,11 +184,10 @@ def extract_cdrs(protein: str, method: str = "anarci") -> Tuple[str, str, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LIABILITY / PTM FLAGGING
+# LIABILITY FLAGGING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def flag_liabilities(cdr3: str) -> str:
-    """Return comma-separated liability flags found in CDR3."""
     flags = [name for name, pat in LIABILITY_PATTERNS.items() if pat.search(cdr3)]
     return ";".join(flags) if flags else "None"
 
@@ -249,12 +201,13 @@ def plot_cdr3_lengths(cdr3_lengths: Counter, output_file: Path):
         return
     lengths = list(cdr3_lengths.elements())
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.hist(lengths, bins=range(min(lengths), max(lengths) + 2), edgecolor="black",
-            color="#4C72B0", alpha=0.85)
+    ax.hist(lengths, bins=range(min(lengths), max(lengths) + 2),
+            edgecolor="black", color="#4C72B0", alpha=0.85)
     ax.set_xlabel("CDR3 Length (aa)", fontsize=12)
     ax.set_ylabel("Frequency", fontsize=12)
     ax.set_title("CDR3 Length Distribution", fontsize=14)
-    ax.axvline(np.mean(lengths), color="red", linestyle="--", label=f"Mean = {np.mean(lengths):.1f}")
+    ax.axvline(np.mean(lengths), color="red", linestyle="--",
+               label=f"Mean = {np.mean(lengths):.1f}")
     ax.legend()
     fig.tight_layout()
     fig.savefig(output_file, dpi=150)
@@ -282,10 +235,6 @@ def plot_qscore_dist(qscores: list, output_file: Path):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
-    """
-    Process a single BAM file and write per-sample output CSVs.
-    Returns a summary dict.
-    """
     bam_out_dir = output_dir / bam_path.stem
     bam_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -296,9 +245,10 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
     out_qplot     = bam_out_dir / f"{stem}_qscore_dist.png"
     out_summary   = bam_out_dir / f"{stem}_summary.json"
 
-    cfg = {**DEFAULT_CONFIG, **config}
-    VHH_F, VHH_R = cfg["VHH_F"], cfg["VHH_R"]
-    MAX_MM = cfg["MAX_MISMATCHES"]
+    cfg        = {**DEFAULT_CONFIG, **config}
+    FR1        = cfg["FR1_MOTIF"]
+    J4         = cfg["J4_MOTIF"]
+    FR_MM      = cfg["FR_MAX_MISMATCHES"]
     CDR_METHOD = cfg["CDR_METHOD"]
 
     seq_counts      = Counter()
@@ -306,10 +256,8 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
     cdr3_lengths    = Counter()
     qscores_all     = []
     umi_seen        = set()
+    stats           = defaultdict(int)
 
-    stats = defaultdict(int)
-
-    # Count total reads for progress bar
     console.print(f"[bold cyan]Processing:[/bold cyan] {bam_path.name}")
     with pysam.AlignmentFile(str(bam_path), check_sq=False) as bam_tmp:
         total_est = sum(1 for _ in bam_tmp.fetch(until_eof=True))
@@ -319,12 +267,13 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
                          desc=stem[:30], unit="reads"):
             stats["total"] += 1
 
-            # ── Basic filters ──────────────────────────────────────────────
+            # ── Alignment pre-filter ───────────────────────────────────────
+            # Unmapped reads have no VHH germline hit — skip immediately.
             if read.is_unmapped or read.query_sequence is None:
                 stats["unmapped"] += 1
                 continue
 
-            seq = read.query_sequence.upper()
+            seq  = read.query_sequence.upper()
             rlen = len(seq)
 
             if rlen < cfg["MIN_READ_LENGTH"]:
@@ -350,30 +299,19 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
                 if umi:
                     umi_seen.add(umi)
 
-            # ── Primer search (strand-agnostic) ────────────────────────────
-            hit = find_primers_both_strands(seq, VHH_F, VHH_R, MAX_MM)
-            if hit is None:
-                stats["no_primer"] += 1
+            # ── FR1 → J4 anchor extraction (strand-agnostic) ──────────────
+            # Operates on full query_sequence (including soft-clips) so the
+            # VHH region is always reachable regardless of alignment boundaries.
+            result = find_vhh_boundaries(seq, FR1, J4, FR_MM)
+            if result is None:
+                stats["no_framework"] += 1
                 continue
 
-            start, end, strand = hit
-            working_seq = seq if strand == "+" else reverse_complement(seq)
-            # Re-search on oriented sequence for exact boundaries
-            fwd_m = fuzzy_search(VHH_F, working_seq, MAX_MM)
-            rev_m = fuzzy_search(VHH_R, working_seq, MAX_MM)
-            if not (fwd_m and rev_m and rev_m[1] > fwd_m[0]):
-                stats["no_primer"] += 1
-                continue
-
-            amplicon = working_seq[fwd_m[0]:rev_m[1]]
-            stats["primer_found"] += 1
-
-            # ── Indel masking ──────────────────────────────────────────────
-            masked_seq, was_masked = mask_indels(amplicon, read) if strand == "+" \
-                else (amplicon, False)  # can't use CIGAR on RC
+            amplicon, strand = result
+            stats["framework_found"] += 1
 
             # ── Translation / frameshift correction ───────────────────────
-            prot = detect_and_correct_frameshift(masked_seq)
+            prot = detect_and_correct_frameshift(amplicon)
             if not prot or len(prot) < cfg["MIN_VHH_AA_LENGTH"]:
                 stats["bad_translation"] += 1
                 continue
@@ -388,11 +326,10 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
                 continue
 
             liabilities = flag_liabilities(cdr3) if cdr3 else "None"
-            tag = "Masked" if was_masked else "Clean"
 
-            seq_counts[(masked_seq, prot, tag)] += 1
+            seq_counts[(amplicon, prot)] += 1
             prot_cdr_counts[(prot, cdr1, cdr2, cdr3,
-                             cdr1 + cdr2 + cdr3, liabilities, tag)] += 1
+                             cdr1 + cdr2 + cdr3, liabilities)] += 1
             if cdr3:
                 cdr3_lengths[len(cdr3)] += 1
             stats["extracted"] += 1
@@ -401,33 +338,29 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
     def _write_csv(path, header, rows):
         rows_sorted = sorted(rows, key=lambda x: x[-1], reverse=True)
         with open(path, "w", newline="") as f:
-            csv.writer(f).writerow(header)
-            csv.writer(f).writerows(rows_sorted)
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerows(rows_sorted)
 
-    dna_rows = [
-        (dna, prot, tag, cnt)
-        for (dna, prot, tag), cnt in seq_counts.items()
-    ]
+    dna_rows = [(dna, prot, cnt) for (dna, prot), cnt in seq_counts.items()]
     cdr_rows = [
-        (prot, c1, c2, c3, concat, liab, tag, cnt)
-        for (prot, c1, c2, c3, concat, liab, tag), cnt in prot_cdr_counts.items()
+        (prot, c1, c2, c3, concat, liab, cnt)
+        for (prot, c1, c2, c3, concat, liab), cnt in prot_cdr_counts.items()
     ]
 
-    _write_csv(out_dna_prot, ["DNA_Sequence", "Protein_Sequence", "Status", "Count"], dna_rows)
+    _write_csv(out_dna_prot, ["DNA_Sequence", "Protein_Sequence", "Count"], dna_rows)
     _write_csv(out_prot_cdr,
                ["Protein_Sequence", "CDR1", "CDR2", "CDR3",
-                "CDR_Concatenated", "Liabilities", "Status", "Count"],
+                "CDR_Concatenated", "Liabilities", "Count"],
                cdr_rows)
 
     plot_cdr3_lengths(cdr3_lengths, out_cdr3_plot)
     if cfg["EXPORT_QC_METRICS"] and qscores_all:
         plot_qscore_dist(qscores_all, out_qplot)
 
-    # ── Copy protein_cdr CSV to parent dir (for clustering step) ─────────────
     export_path = output_dir.parent / f"{stem}_vhh_protein_cdr.csv"
     shutil.copy(out_prot_cdr, export_path)
 
-    # ── JSON summary ───────────────────────────────────────────────────────────
     summary = {
         "file": bam_path.name,
         "stats": dict(stats),
@@ -436,6 +369,9 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
         "median_qscore": float(np.median(qscores_all)) if qscores_all else None,
         "cdr_method": CDR_METHOD,
         "anarci_available": ANARCI_AVAILABLE,
+        "fr1_motif": FR1,
+        "j4_motif": J4,
+        "fr_max_mismatches": FR_MM,
     }
     with open(out_summary, "w") as f:
         json.dump(summary, f, indent=2)
@@ -449,20 +385,20 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VHH BAM extractor — ONT-optimised with ANARCI CDR numbering"
+        description="VHH BAM extractor — alignment-filtered, framework-anchored"
     )
-    parser.add_argument("input_dir", help="Directory containing .bam files")
-    parser.add_argument("--max-mm",       type=int,   default=1,       help="Max primer mismatches (default: 1)")
-    parser.add_argument("--min-q",        type=float, default=10.0,    help="Min mean ONT Q-score (default: 10)")
-    parser.add_argument("--min-len",      type=int,   default=300,     help="Min read length bp (default: 300)")
-    parser.add_argument("--max-len",      type=int,   default=1000,    help="Max read length bp (default: 1000)")
-    parser.add_argument("--min-aa",       type=int,   default=100,     help="Min VHH aa length (default: 100)")
-    parser.add_argument("--cdr-method",   default="anarci",
-                        choices=["anarci", "offset"],                  help="CDR extraction method")
-    parser.add_argument("--use-umi",      action="store_true",         help="Enable UMI deduplication")
-    parser.add_argument("--umi-tag",      default="UX",                help="BAM tag for UMI (default: UX)")
-    parser.add_argument("--vhh-f",        default="CAGGTACAGCTGCA",    help="Forward primer sequence")
-    parser.add_argument("--vhh-r",        default="CGGTGTCTAGCACT",    help="Reverse primer sequence")
+    parser.add_argument("input_dir",    help="Directory containing .bam files aligned to IMGT VHH germlines")
+    parser.add_argument("--fr1",        default="CAGGTGCAGCTG",  help="FR1 anchor motif (default: CAGGTGCAGCTG)")
+    parser.add_argument("--j4",         default="ACCCAGGTCACC",  help="J4 anchor motif  (default: ACCCAGGTCACC)")
+    parser.add_argument("--fr-mm",      type=int, default=2,     help="Max mismatches for framework motifs (default: 2)")
+    parser.add_argument("--min-q",      type=float, default=10.0, help="Min mean ONT Q-score (default: 10)")
+    parser.add_argument("--min-len",    type=int, default=300,    help="Min read length bp (default: 300)")
+    parser.add_argument("--max-len",    type=int, default=1000,   help="Max read length bp (default: 1000)")
+    parser.add_argument("--min-aa",     type=int, default=100,    help="Min VHH aa length (default: 100)")
+    parser.add_argument("--cdr-method", default="anarci", choices=["anarci", "offset"],
+                        help="CDR extraction method (default: anarci)")
+    parser.add_argument("--use-umi",    action="store_true",      help="Enable UMI deduplication")
+    parser.add_argument("--umi-tag",    default="UX",             help="BAM tag for UMI (default: UX)")
     args = parser.parse_args()
 
     input_dir  = Path(args.input_dir)
@@ -470,7 +406,9 @@ def main():
     output_dir.mkdir(exist_ok=True)
 
     config = {
-        "MAX_MISMATCHES":   args.max_mm,
+        "FR1_MOTIF":        args.fr1,
+        "J4_MOTIF":         args.j4,
+        "FR_MAX_MISMATCHES": args.fr_mm,
         "MIN_MEAN_QSCORE":  args.min_q,
         "MIN_READ_LENGTH":  args.min_len,
         "MAX_READ_LENGTH":  args.max_len,
@@ -478,42 +416,44 @@ def main():
         "CDR_METHOD":       args.cdr_method,
         "USE_UMI":          args.use_umi,
         "UMI_TAG":          args.umi_tag,
-        "VHH_F":            args.vhh_f,
-        "VHH_R":            args.vhh_r,
     }
 
-    all_summaries = []
     bam_files = list(input_dir.glob("*.bam"))
     if not bam_files:
         console.print("[red]No .bam files found in directory.[/red]")
         return
 
+    all_summaries = []
     for bam_path in bam_files:
-        summary = process_bam(bam_path, output_dir, config)
-        all_summaries.append(summary)
+        all_summaries.append(process_bam(bam_path, output_dir, config))
 
-    # ── Print summary table ────────────────────────────────────────────────────
     table = Table(title="BAM Extraction Summary", show_lines=True)
-    table.add_column("File", style="cyan", no_wrap=True)
-    table.add_column("Total Reads", justify="right")
-    table.add_column("Primer Found", justify="right")
-    table.add_column("Extracted VHHs", justify="right")
-    table.add_column("Unique Proteins", justify="right")
-    table.add_column("Median Q", justify="right")
+    table.add_column("File",             style="cyan", no_wrap=True)
+    table.add_column("Total Reads",      justify="right")
+    table.add_column("Unmapped",         justify="right")
+    table.add_column("Framework Found",  justify="right")
+    table.add_column("Extracted VHHs",   justify="right")
+    table.add_column("Unique Proteins",  justify="right")
+    table.add_column("Median Q",         justify="right")
 
     for s in all_summaries:
         st = s["stats"]
         table.add_row(
             s["file"],
             str(st.get("total", 0)),
-            str(st.get("primer_found", 0)),
+            str(st.get("unmapped", 0)),
+            str(st.get("framework_found", 0)),
             str(st.get("extracted", 0)),
             str(s["unique_proteins"]),
             f"{s['median_qscore']:.1f}" if s["median_qscore"] else "N/A",
         )
+
     console.print(table)
     console.print(f"\n[green]✓ Output written to:[/green] {output_dir}")
-    console.print(f"[dim]ANARCI CDR numbering: {'enabled' if ANARCI_AVAILABLE else 'unavailable — using offset fallback'}[/dim]")
+    console.print(
+        f"[dim]ANARCI: {'enabled' if ANARCI_AVAILABLE else 'unavailable — using offset fallback'} | "
+        f"FR1: {args.fr1} | J4: {args.j4} | max_mm: {args.fr_mm}[/dim]"
+    )
 
 
 if __name__ == "__main__":

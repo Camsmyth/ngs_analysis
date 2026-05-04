@@ -175,7 +175,7 @@ Accepts `.csv` or `.xlsx` consensus input. Matches clusters by exact CDR3 identi
 python cluster_enrichment.py \
   R1_cluster_consensus.csv \
   R2_cluster_consensus.csv \
-  --output VHH_enrichment.xlsx \
+  --output results/ \
   --min-r2-count 10 \
   --log2-cutoff 1.0 \
   --fdr-cutoff 0.05
@@ -185,7 +185,7 @@ python cluster_enrichment.py \
 |------|---------|-------------|
 | `file_r1` | — | Round 1 consensus file (.csv or .xlsx) |
 | `file_r2` | — | Round 2 consensus file (.csv or .xlsx) |
-| `--output` | VHH_enrichment.xlsx | Output Excel path (a matching .csv is always written) |
+| `--output` | `.` | Output directory for enrichment CSV and plots |
 | `--threshold` | 0.85 | Normalised Levenshtein similarity for fuzzy CDR3 matching |
 | `--no-fuzzy` | off | Exact CDR3 matching only |
 | `--log2-cutoff` | 1.0 | log2 enrichment cutoff for volcano |
@@ -235,8 +235,7 @@ python run_pipeline.py \
 | `*_summary.json` | 1 | Per-BAM read fate statistics |
 | `*_clonotypes.csv` | 2 | Per-sequence clonotype assignments + Cluster_Count |
 | `*_cluster_consensus.csv` | 2 | One row per clonotype; Count-weighted consensus + biophysics |
-| `VHH_enrichment.xlsx` | 3 | Enrichment table: log2, CPM, p-value, FDR (colour-formatted) |
-| `VHH_enrichment.csv` | 3 | Same table as CSV for programmatic use |
+| `VHH_enrichment.csv` | 3 | Enrichment table: log2, CPM, p-value, FDR |
 | `*_volcano.png` | 3 | Volcano plot (log2 enrichment vs −log10 FDR) |
 | `*_rank_enrichment.png` | 3 | Rank-ordered enrichment bar chart |
 

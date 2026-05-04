@@ -13,8 +13,8 @@ compute enrichment scores.
   • 1:1 R1→R2 matching enforced; duplicate fuzzy matches treated as novel
   • Shannon entropy quality flag for heterogeneous clusters
   • Volcano plot with bubble size proportional to R2 cluster depth
-  • Accepts both CSV and Excel consensus outputs (auto-detects by extension)
-  • Outputs both Excel (formatted) and CSV (programmatic use)
+  • Accepts both CSV and Excel consensus inputs (auto-detects by extension)
+  • Outputs CSV + plots to a user-specified directory
 """
 
 import sys
@@ -34,10 +34,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import openpyxl
-from openpyxl.styles import PatternFill
-from openpyxl.formatting.rule import ColorScaleRule
-from openpyxl.utils import get_column_letter
 from rich.console import Console
 from rich.table import Table
 
@@ -197,36 +193,6 @@ def plot_rank_enrichment(df: pd.DataFrame, output_path: Path):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EXCEL OUTPUT
-# ══════════════════════════════════════════════════════════════════════════════
-
-def write_enrichment_excel(df: pd.DataFrame, output_path: Path):
-    df.to_excel(output_path, index=False)
-    wb = openpyxl.load_workbook(output_path)
-    ws = wb.active
-    header = {c.value: get_column_letter(i + 1) for i, c in enumerate(ws[1])}
-    last = ws.max_row
-
-    if "Log2_Enrichment" in header:
-        col = header["Log2_Enrichment"]
-        ws.conditional_formatting.add(
-            f"{col}2:{col}{last}",
-            ColorScaleRule(start_type="min", start_color="4472C4",
-                           mid_type="num",  mid_value=0,   mid_color="FFFFFF",
-                           end_type="max",  end_color="FF0000"),
-        )
-    if "FDR" in header:
-        sig_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-        from openpyxl.formatting.rule import CellIsRule
-        col = header["FDR"]
-        ws.conditional_formatting.add(
-            f"{col}2:{col}{last}",
-            CellIsRule(operator="lessThan", formula=["0.05"], fill=sig_fill)
-        )
-    wb.save(output_path)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -245,7 +211,7 @@ def _read_consensus(filepath: str) -> pd.DataFrame:
 def calculate_enrichment(
     file_r1:      str,
     file_r2:      str,
-    output_file:  str   = "VHH_enrichment.xlsx",
+    output_dir:   str   = ".",
     threshold:    float = 0.85,
     use_fuzzy:    bool  = True,
     log2_cutoff:  float = 1.0,
@@ -318,13 +284,11 @@ def calculate_enrichment(
         )
 
     # ── Outputs ───────────────────────────────────────────────────────────────
-    out_path = Path(output_file)
-    out_dir  = out_path.parent
-    stem     = out_path.stem
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = "VHH_enrichment"
 
-    write_enrichment_excel(merged, out_path)
-
-    csv_path = out_path.with_suffix(".csv")
+    csv_path = out_dir / f"{stem}.csv"
     merged.to_csv(csv_path, index=False)
     console.print(f"[green]✓ Enrichment CSV:[/green] {csv_path}")
 
@@ -347,7 +311,7 @@ def calculate_enrichment(
     table.add_row(f"Enriched (log2≥{log2_cutoff}, FDR<{fdr_cutoff})",  str(sig_enriched))
     table.add_row(f"Depleted (log2≤-{log2_cutoff}, FDR<{fdr_cutoff})", str(sig_depleted))
     console.print(table)
-    console.print(f"\n[green]✓ Enrichment written to:[/green] {out_path}")
+    console.print(f"\n[green]✓ Enrichment written to:[/green] {out_dir}/")
 
     return merged
 
@@ -362,8 +326,8 @@ def main():
     )
     parser.add_argument("file_r1",    help="Round 1 cluster consensus file (.csv or .xlsx)")
     parser.add_argument("file_r2",    help="Round 2 cluster consensus file (.csv or .xlsx)")
-    parser.add_argument("--output",   default="VHH_enrichment.xlsx",
-                        help="Output Excel filename (a matching .csv is always written too)")
+    parser.add_argument("--output", default=".",
+                        help="Output directory for enrichment CSV and plots (default: current directory)")
     parser.add_argument("--threshold", type=float, default=0.85,
                         help="Normalised Levenshtein similarity threshold for fuzzy CDR3 matching (default: 0.85)")
     parser.add_argument("--no-fuzzy", action="store_true",
@@ -385,7 +349,7 @@ def main():
 
     calculate_enrichment(
         args.file_r1, args.file_r2,
-        output_file=args.output,
+        output_dir=args.output,
         threshold=args.threshold,
         use_fuzzy=not args.no_fuzzy,
         log2_cutoff=args.log2_cutoff,

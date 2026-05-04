@@ -91,12 +91,10 @@ def run_enrichment(r1_file, r2_file, args):
     console.print(Rule("[bold cyan]Step 3 — Enrichment Analysis[/bold cyan]"))
     from cluster_enrichment import calculate_enrichment
 
-    output = args.enrich_output or str(
-        Path(r2_file).parent / "VHH_enrichment.xlsx"
-    )
+    output = args.enrich_output or str(Path(r2_file).parent)
     calculate_enrichment(
         str(r1_file), str(r2_file),
-        output_file=output,
+        output_dir=output,
         threshold=args.match_threshold,
         use_fuzzy=not args.no_fuzzy,
         log2_cutoff=args.log2_cutoff,
@@ -140,8 +138,8 @@ def main():
     # ── Enrichment ────────────────────────────────────────────────────────────
     p.add_argument("--r1-consensus",  help="Round 1 cluster consensus .csv (or .xlsx)")
     p.add_argument("--r2-consensus",  help="Round 2 cluster consensus .csv (enrich-only mode)")
-    p.add_argument("--enrich-output", default="VHH_enrichment.xlsx",
-                   help="Output enrichment Excel path (default: VHH_enrichment.xlsx)")
+    p.add_argument("--enrich-output", default=".",
+                   help="Output directory for enrichment CSV and plots (default: R2 consensus directory)")
     p.add_argument("--match-threshold", type=float, default=0.85,
                    help="Levenshtein similarity threshold for fuzzy CDR3 matching (default: 0.85)")
     p.add_argument("--no-fuzzy",  action="store_true")

@@ -109,27 +109,33 @@ def batch_mean_qscore(qualities_list: list, use_gpu: bool = False) -> list:
     if not qualities_list:
         return []
 
+    # read.query_qualities is None when a BAM has no stored quality scores
+    qualities_list = [q if q is not None else [] for q in qualities_list]
+
     if use_gpu and GPU_AVAILABLE and cp is not None:
-        max_len = max(len(q) for q in qualities_list)
-        n = len(qualities_list)
+        lengths  = np.array([len(q) for q in qualities_list], dtype=np.int32)
+        max_len  = int(lengths.max())
+        if max_len == 0:
+            return [0.0] * len(qualities_list)
+        n      = len(qualities_list)
         padded = np.zeros((n, max_len), dtype=np.float32)
-        lengths = np.zeros(n, dtype=np.int32)
         for i, q in enumerate(qualities_list):
-            ln = len(q)
-            padded[i, :ln] = q
-            lengths[i] = ln
+            if len(q):
+                padded[i, :len(q)] = q
 
         padded_gpu  = cp.asarray(padded)
         lengths_gpu = cp.asarray(lengths, dtype=cp.float32)
 
-        err = cp.power(10.0, -padded_gpu / 10.0)
-        # mask out padding positions
+        err  = cp.power(10.0, -padded_gpu / 10.0)
         mask = cp.arange(max_len)[None, :] < cp.asarray(lengths)[:, None]
         err  = err * mask
 
-        mean_errs = err.sum(axis=1) / lengths_gpu
+        safe_len  = cp.where(lengths_gpu > 0, lengths_gpu, 1.0)
+        mean_errs = err.sum(axis=1) / safe_len
         mean_errs = cp.clip(mean_errs, 1e-30, None)
         qscores   = -10.0 * cp.log10(mean_errs)
+        # reads with no quality data get Q=0.0 → filtered by MIN_MEAN_QSCORE
+        qscores   = cp.where(lengths_gpu > 0, qscores, 0.0)
         return cp.asnumpy(qscores).tolist()
 
     # CPU path

@@ -10,7 +10,7 @@ compute enrichment scores. Key improvements over original:
   • Volcano plot (log2 enrichment vs -log10 FDR)
   • CDR3 matching by exact identity (preferred) with BLOSUM62 fallback
   • Clear handling of sequences absent in round 1 (novel enrichment)
-  • Accepts both BLOSUM and HDBSCAN consensus Excel outputs (auto-detects format)
+  • Accepts both CSV and Excel consensus outputs (auto-detects by extension)
   • Interactive HTML summary report
   • Configurable significance thresholds
 """
@@ -234,6 +234,18 @@ def write_enrichment_excel(df: pd.DataFrame, output_path: Path):
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _read_consensus(filepath: str) -> pd.DataFrame:
+    """Read a cluster consensus file — accepts .csv or .xlsx."""
+    ext = Path(filepath).suffix.lower()
+    if ext == ".csv":
+        return pd.read_csv(filepath)
+    elif ext in (".xlsx", ".xls"):
+        return pd.read_excel(filepath)
+    else:
+        console.print(f"[red]ERROR: Unsupported file extension '{ext}'. Use .csv or .xlsx.[/red]")
+        sys.exit(1)
+
+
 def calculate_enrichment(
     file_r1:     str,
     file_r2:     str,
@@ -244,8 +256,8 @@ def calculate_enrichment(
     fdr_cutoff:  float = 0.05,
 ) -> pd.DataFrame:
 
-    df_r1 = pd.read_excel(file_r1)
-    df_r2 = pd.read_excel(file_r2)
+    df_r1 = _read_consensus(file_r1)
+    df_r2 = _read_consensus(file_r2)
 
     # Normalise columns
     for df in [df_r1, df_r2]:
@@ -332,8 +344,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="VHH phage display enrichment analysis (R1 vs R2 cluster comparison)"
     )
-    parser.add_argument("file_r1",    help="Round 1 cluster consensus Excel (.xlsx)")
-    parser.add_argument("file_r2",    help="Round 2 cluster consensus Excel (.xlsx)")
+    parser.add_argument("file_r1",    help="Round 1 cluster consensus file (.csv or .xlsx)")
+    parser.add_argument("file_r2",    help="Round 2 cluster consensus file (.csv or .xlsx)")
     parser.add_argument("--output",   default="VHH_enrichment.xlsx",
                         help="Output Excel filename")
     parser.add_argument("--threshold", type=float, default=0.90,

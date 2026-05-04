@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cluster_levenshtein.py — Step 2c of the VHH NGS pipeline.
+cluster_levenshtein.py — Step 2 of the VHH NGS pipeline.
 
 Graph-based clonotyping using normalised Levenshtein (edit) distance.
 
@@ -30,9 +30,8 @@ Optional V-gene stratification:
   This mirrors the EuroClonality-NGS convention for meta-clonotypes.
 
 Outputs (all enrichment-pipeline compatible):
-  *_lev_clonotypes.csv          — per-sequence cluster assignments
-  *_lev_cluster_consensus.csv   — one row per clonotype, with CDR3 + Cluster_Count
-  *_lev_cluster_consensus.xlsx  — formatted Excel with heatmap
+  {prefix}_clonotypes.csv          — per-sequence cluster assignments
+  {prefix}_cluster_consensus.csv   — one row per clonotype, with biophysical metrics
 """
 
 import argparse
@@ -50,10 +49,30 @@ from rapidfuzz import process as rf_process
 from tqdm import tqdm
 from rich.console import Console
 from rich.table import Table
-import openpyxl
-from openpyxl.formatting.rule import ColorScaleRule
+from Bio.SeqUtils.ProtParam import ProteinAnalysis
 
 console = Console()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BIOPHYSICAL METRICS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calc_biophysical(seq: str) -> dict:
+    empty = {"pI": "", "GRAVY": "", "Charge_pH7": "", "Aromaticity": "", "MW_kDa": ""}
+    if not seq or len(seq) < 4:
+        return empty
+    try:
+        pa = ProteinAnalysis(seq.replace("-", "").replace("*", ""))
+        return {
+            "pI":          round(pa.isoelectric_point(), 2),
+            "GRAVY":       round(pa.gravy(), 3),
+            "Charge_pH7":  round(pa.charge_at_pH(7.0), 2),
+            "Aromaticity": round(pa.aromaticity(), 3),
+            "MW_kDa":      round(pa.molecular_weight() / 1000, 2),
+        }
+    except Exception:
+        return empty
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -180,35 +199,17 @@ def weighted_consensus(seqs: List[str], weights: Optional[List[int]] = None) -> 
     return "".join(c for c in result if c != "-")
 
 
-def shannon_entropy(seqs: List[str]) -> float:
-    total  = len(seqs)
-    if total <= 1:
+def shannon_entropy(seqs: List[str], weights: Optional[List[int]] = None) -> float:
+    """Read-count-weighted Shannon entropy over CDR3 sequences within a cluster."""
+    if weights is None:
+        weights = [1] * len(seqs)
+    total = sum(weights)
+    if total <= 0:
         return 0.0
-    counts = Counter(seqs)
-    return -sum((c / total) * np.log2(c / total) for c in counts.values())
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EXCEL OUTPUT
-# ══════════════════════════════════════════════════════════════════════════════
-
-def write_excel(df: pd.DataFrame, path: Path):
-    df.to_excel(path, index=False)
-    wb = openpyxl.load_workbook(path)
-    ws = wb.active
-    last = ws.max_row
-    if "Cluster_Count" in df.columns:
-        col_idx = list(df.columns).index("Cluster_Count") + 1
-        col_letter = ws.cell(row=1, column=col_idx).column_letter
-        ws.conditional_formatting.add(
-            f"{col_letter}2:{col_letter}{last}",
-            ColorScaleRule(
-                start_type="min",        start_color="FFFFFF",
-                mid_type="percentile",   mid_value=50,   mid_color="FFFF99",
-                end_type="max",          end_color="FF0000",
-            ),
-        )
-    wb.save(path)
+    tally: Counter = Counter()
+    for seq, w in zip(seqs, weights):
+        tally[seq] += w
+    return -sum((c / total) * np.log2(c / total) for c in tally.values() if c > 0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -217,13 +218,13 @@ def write_excel(df: pd.DataFrame, path: Path):
 
 def run_levenshtein_clustering(
     input_csv:         str,
+    output_prefix:     str,      # stem for output files
     threshold:         float = 0.80,
     seq_column:        str   = "CDR3",
     min_cluster_count: int   = 5,
     use_vgene:         bool  = False,
 ):
     input_path = Path(input_csv)
-    base       = input_path.with_suffix("")
 
     # ── Load & clean ───────────────────────────────────────────────────────────
     df = pd.read_csv(input_csv)
@@ -286,7 +287,7 @@ def run_levenshtein_clustering(
     df["Cluster_Count"] = df["Cluster"].map(cluster_counts)
 
     # ── Per-sequence output ────────────────────────────────────────────────────
-    cluster_csv = str(base) + "_lev_clonotypes.csv"
+    cluster_csv = f"{output_prefix}_clonotypes.csv"
     df.to_csv(cluster_csv, index=False)
 
     # ── Consensus per clonotype ────────────────────────────────────────────────
@@ -296,10 +297,14 @@ def run_levenshtein_clustering(
         seqs_c  = sub[seq_column].tolist()
         wts_c   = sub[count_col].tolist() if count_col else None
         consensus  = weighted_consensus(seqs_c, wts_c)
-        entropy    = shannon_entropy(seqs_c)
+        entropy    = shannon_entropy(seqs_c, wts_c)   # count-weighted
         total_cnt  = sub[count_col].sum() if count_col else len(sub)
         n_unique   = sub[seq_column].nunique()
-        mean_len   = round(np.mean([len(s) for s in seqs_c]), 1)
+        # Count-weighted mean CDR3 length
+        if wts_c:
+            mean_len = round(sum(len(s) * w for s, w in zip(seqs_c, wts_c)) / sum(wts_c), 1)
+        else:
+            mean_len = round(np.mean([len(s) for s in seqs_c]), 1)
 
         # Representative: highest-count sequence
         if count_col:
@@ -307,46 +312,74 @@ def run_levenshtein_clustering(
         else:
             rep_row = sub.iloc[0]
 
-        row = {
-            "Cluster":         cid,
-            "CDR3":            consensus,          # required by enrichment step
-            "Representative_CDR3": rep_row[seq_column],
-            "Cluster_Count":   int(total_cnt),     # required by enrichment step
-            "Members":         len(sub),
-            "Unique_CDR3s":    n_unique,
-            "Mean_CDR3_Length": mean_len,
-            "Shannon_Entropy": round(entropy, 3),
-        }
+        # CDR columns from representative row
+        cdr1 = rep_row["CDR1"] if "CDR1" in rep_row.index else ""
+        cdr2 = rep_row["CDR2"] if "CDR2" in rep_row.index else ""
+        cdr_concat = rep_row["CDR_Concatenated"] if "CDR_Concatenated" in rep_row.index else ""
 
-        # Carry over optional columns if present
-        for col in ["CDR1", "CDR2", "CDR_Concatenated", "Protein_Sequence"]:
-            if col in rep_row.index:
-                row[col] = rep_row[col]
+        # Per-CDR lengths from representative
+        cdr1_len = len(str(cdr1)) if cdr1 and str(cdr1) not in ("", "nan") else ""
+        cdr2_len = len(str(cdr2)) if cdr2 and str(cdr2) not in ("", "nan") else ""
+        cdr3_len = len(consensus)
+
+        # Liabilities: union of unique flags across all cluster members
+        if "Liabilities" in sub.columns:
+            all_liab = set()
+            for v in sub["Liabilities"].dropna():
+                if str(v).strip().lower() not in ("none", ""):
+                    all_liab.update(str(v).split(";"))
+            liabilities = ";".join(sorted(all_liab)) if all_liab else "None"
+        else:
+            liabilities = "None"
+
+        # Biophysical metrics on CDR_Concatenated consensus
+        biophys = calc_biophysical(str(cdr_concat) if cdr_concat and str(cdr_concat) not in ("", "nan") else "")
+
+        row = {
+            "Cluster":            cid,
+            "CDR3":               consensus,
+            "CDR1":               cdr1,
+            "CDR2":               cdr2,
+            "CDR_Concatenated":   cdr_concat,
+            "Representative_CDR3": rep_row[seq_column],
+            "Cluster_Count":      int(total_cnt),   # total reads (sum of Count)
+            "Unique_Sequences":   n_unique,         # distinct CDR3 strings in cluster
+
+            "Mean_CDR3_Length":   mean_len,
+            "CDR1_Length":        cdr1_len,
+            "CDR2_Length":        cdr2_len,
+            "CDR3_Length":        cdr3_len,
+            "Shannon_Entropy":    round(entropy, 3),
+            "pI":                 biophys["pI"],
+            "GRAVY":              biophys["GRAVY"],
+            "Charge_pH7":         biophys["Charge_pH7"],
+            "Aromaticity":        biophys["Aromaticity"],
+            "MW_kDa":             biophys["MW_kDa"],
+            "Liabilities":        liabilities,
+        }
 
         consensus_rows.append(row)
 
     consensus_df  = pd.DataFrame(consensus_rows)
-    consensus_csv  = str(base) + "_lev_cluster_consensus.csv"
-    consensus_xlsx = Path(str(base) + "_lev_cluster_consensus.xlsx")
+    consensus_csv = f"{output_prefix}_cluster_consensus.csv"
 
     consensus_df.to_csv(consensus_csv, index=False)
-    write_excel(consensus_df, consensus_xlsx)
 
     # ── Summary table ──────────────────────────────────────────────────────────
     total_reads = df[count_col].sum() if count_col else len(df)
     table = Table(title="Levenshtein Clonotyping Summary", show_lines=True)
     table.add_column("Metric",         style="cyan")
     table.add_column("Value",          justify="right")
-    table.add_row("Input sequences",   str(len(df)))
-    table.add_row("Unique CDR3s",      str(len(unique_seqs)))
-    table.add_row("Clonotypes",        str(len(consensus_rows)))
-    table.add_row("Similarity threshold", f"{threshold:.0%}")
-    table.add_row("Reads clustered",   f"{total_reads:,}")
-    table.add_row("Singletons (pre-filter)", str(sum(1 for c in components if len(c)==1)))
+    table.add_row("Unique input CDR3s",      str(len(unique_seqs)))
+    table.add_row("Clonotypes",              str(len(consensus_rows)))
+    table.add_row("Similarity threshold",    f"{threshold:.0%}")
+    table.add_row("Total reads clustered",   f"{int(total_reads):,}")
+    table.add_row("Singletons (pre-filter)", str(sum(1 for c in components if len(c) == 1)))
     console.print(table)
     console.print(f"\n[green]✓[/green] {cluster_csv}")
     console.print(f"[green]✓[/green] {consensus_csv}")
-    console.print(f"[green]✓[/green] {consensus_xlsx}")
+
+    return consensus_csv
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -370,6 +403,8 @@ Rule of thumb for VHH phage display:
         """
     )
     parser.add_argument("--input",     required=True,  help="Input CSV")
+    parser.add_argument("--output",    default=None,
+                        help="Output file prefix/stem (default: input file stem)")
     parser.add_argument("--column",    default="CDR3",  help="Sequence column (default: CDR3)")
     parser.add_argument("--threshold", type=float, default=0.80,
                         help="Normalised similarity threshold 0–1 (default: 0.80)")
@@ -379,8 +414,16 @@ Rule of thumb for VHH phage display:
                         help="Stratify by V_gene column if present")
     args = parser.parse_args()
 
+    # Derive default output prefix from input stem in same directory
+    if args.output is None:
+        input_path = Path(args.input)
+        output_prefix = str(input_path.parent / input_path.stem)
+    else:
+        output_prefix = args.output
+
     run_levenshtein_clustering(
         args.input,
+        output_prefix=output_prefix,
         threshold=args.threshold,
         seq_column=args.column,
         min_cluster_count=args.min_count,

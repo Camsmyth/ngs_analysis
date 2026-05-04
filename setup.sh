@@ -89,23 +89,20 @@ info "Verifying imports..."
 "$PYTHON_VENV" - <<'PYCHECK'
 import importlib, sys
 required = [
-    ("Bio",           "biopython"),
-    ("pysam",         "pysam"),
-    ("anarci",        "anarci"),
-    ("regex",         "regex"),
-    ("hdbscan",       "hdbscan"),
-    ("umap",          "umap-learn"),
-    ("scipy",         "scipy"),
-    ("statsmodels",   "statsmodels"),
-    ("sklearn",       "scikit-learn"),
-    ("numpy",         "numpy"),
-    ("pandas",        "pandas"),
-    ("matplotlib",    "matplotlib"),
-    ("openpyxl",      "openpyxl"),
-    ("rich",          "rich"),
-    ("tqdm",          "tqdm"),
-    ("rapidfuzz",     "rapidfuzz"),
-    ("networkx",      "networkx"),
+    ("Bio",        "biopython"),
+    ("pysam",      "pysam"),
+    ("anarci",     "anarci"),
+    ("regex",      "regex"),
+    ("scipy",      "scipy"),
+    ("statsmodels","statsmodels"),
+    ("numpy",      "numpy"),
+    ("pandas",     "pandas"),
+    ("matplotlib", "matplotlib"),
+    ("openpyxl",   "openpyxl"),
+    ("rich",       "rich"),
+    ("tqdm",       "tqdm"),
+    ("rapidfuzz",  "rapidfuzz"),
+    ("networkx",   "networkx"),
 ]
 failed = []
 for mod, pkg in required:
@@ -134,8 +131,6 @@ echo "    python run_pipeline.py --help"
 echo ""
 echo "  Run individual steps:"
 echo "    python bam_extract.py <bam_dir> --min-q 12 --cdr-method anarci"
-echo "    python cluster_blosum.py --input <csv> --threshold 30"
 echo "    python cluster_levenshtein.py --input <csv> --threshold 0.85"
-echo "    python hdbscan_cluster.py <dir> --min-cluster-counts 10"
-echo "    python cluster_enrichment.py <R1.xlsx> <R2.xlsx>"
+echo "    python cluster_enrichment.py <R1_consensus.csv> <R2_consensus.csv>"
 echo ""

@@ -2,7 +2,7 @@
 
 VHH nanobody NGS pipeline for Oxford Nanopore (PromethION) phage display enrichment analysis.
 
-Processes Dorado-basecalled BAM files through CDR extraction, sequence clustering, and round-over-round enrichment scoring.
+Processes Dorado-basecalled BAM files (aligned to IMGT Vicugna germlines) through CDR extraction, sequence clustering, and round-over-round enrichment scoring.
 
 ---
 
@@ -13,20 +13,22 @@ BAM files (Dorado/PromethION)
 aligned to IMGT Vicugna germlines
         │
         ▼
-  bam_extract.py          ← alignment filter, FR1/J4 anchor extraction, CDR annotation
+  bam_extract.py            ← alignment filter, FR1/J4 anchor extraction, CDR annotation
         │
         ▼
-  cluster_blosum.py       ← BLOSUM62 hierarchical clustering   ┐
-        or                                                      ├─ choose one
-  hdbscan_cluster.py      ← physicochemical HDBSCAN clustering ┘
+  cluster_blosum.py         ← BLOSUM62 hierarchical clustering        ┐
+        or                                                             ├─ choose one
+  hdbscan_cluster.py        ← physicochemical HDBSCAN clustering      ┤
+        or                                                             │
+  cluster_levenshtein.py    ← graph-based clonotyping (edit distance) ┘
         │
         ▼
-  cluster_enrichment.py   ← log2 CPM enrichment + FDR statistics
+  cluster_enrichment.py     ← log2 CPM enrichment + FDR statistics
 ```
 
 Or run everything via the orchestrator:
 ```
-  run_pipeline.py         ← chains all steps from a single CLI call
+  run_pipeline.py           ← chains all steps from a single CLI call
 ```
 
 ---
@@ -90,11 +92,24 @@ python bam_extract.py /path/to/bams --min-q 12 --cdr-method anarci
 ```
 
 > **Note:** BAM files must be aligned to the IMGT Vicugna VHH germline database
-> before running this script (e.g. with `minimap2` or `bwa`). Unaligned BAMs will
-> yield ~5% recovery at best.
+> before running this script (e.g. with `minimap2 -ax map-ont`). Unaligned BAMs
+> will yield ~5% recovery at best.
+
+---
 
 ### `cluster_blosum.py`
-BLOSUM62 hierarchical clustering of CDR3 sequences.
+BLOSUM62-distance hierarchical clustering of CDR3 sequences. Best suited to
+grouping sequences by amino-acid physicochemical similarity without regard to
+CDR3 length variation.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input` | — | Input CSV (`*_vhh_protein_cdr.csv`) |
+| `--threshold` | — | Distance cutoff 0–100 (lower = stricter, **required**) |
+| `--column` | CDR3 | Sequence column to cluster |
+| `--min-count` | 5 | Min total reads to report a cluster |
+| `--linkage` | average | Linkage method: `single`, `complete`, `average`, `ward` |
+| `--jobs` | -1 | CPU cores for distance matrix (-1 = all) |
 
 ```bash
 python cluster_blosum.py \
@@ -103,6 +118,64 @@ python cluster_blosum.py \
   --min-count 5 \
   --jobs -1
 ```
+
+**Linkage method guide:**
+
+| Method | Behaviour | Best for |
+|--------|-----------|----------|
+| `average` (UPGMA) | Cluster distance = mean of all pairwise distances | General use — balanced, outlier-resistant |
+| `complete` | Cluster distance = max pairwise (furthest neighbour) | Tight homogeneous clusters; many small groups |
+| `single` | Cluster distance = min pairwise (nearest neighbour) | Rarely useful — prone to chaining artefacts |
+| `ward` | Minimise within-cluster variance | Avoid with BLOSUM distances (not Euclidean) |
+
+---
+
+### `cluster_levenshtein.py`
+Graph-based clonotyping using normalised Levenshtein (edit) distance. The
+preferred method for VHH CDR3 clustering when length variation between clones
+is high — somatic hypermutation and junction exonuclease activity can introduce
+insertions/deletions that BLOSUM gap penalties handle arbitrarily, whereas
+Levenshtein naturally scales with sequence length.
+
+Two CDR3s are linked if their normalised Levenshtein similarity ≥ `--threshold`
+(default 0.80, i.e. ≤ 20% edits). Connected components of the resulting graph
+define clonotypes. Uses [rapidfuzz](https://github.com/maxbachmann/RapidFuzz)
+SIMD acceleration; switches to a BK-tree approximation for > 5,000 unique sequences.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input` | — | Input CSV (`*_vhh_protein_cdr.csv`) |
+| `--threshold` | 0.80 | Similarity threshold 0–1 (higher = stricter) |
+| `--column` | CDR3 | Sequence column to cluster |
+| `--min-count` | 5 | Min total reads to report a clonotype |
+| `--use-vgene` | off | Stratify by `V_gene` column if present |
+
+```bash
+python cluster_levenshtein.py \
+  --input sample_vhh_protein_cdr.csv \
+  --threshold 0.85 \
+  --min-count 5
+```
+
+**Threshold guide:**
+
+| Threshold | Edits per 14 aa CDR3 | Use case |
+|-----------|----------------------|----------|
+| 0.95 | ~1 | Exact-clone tracking across runs |
+| 0.85 | ~2 | Standard enrichment analysis (recommended) |
+| 0.80 | ~3 | Captures affinity-matured variants |
+| 0.70 | ~4 | Groups distant CDR3 families |
+
+**BLOSUM vs Levenshtein — when to choose which:**
+
+- **Levenshtein** — when CDR3 length varies across your library (typical for
+  naive or early-selection datasets); when you want B-cell repertoire-style
+  clonotyping; when speed matters on large datasets.
+- **BLOSUM** — when sequences are length-normalised or CDR3 lengths are
+  homogeneous; when amino-acid physicochemical similarity should drive grouping
+  (e.g. grouping HCDR3s that bind the same epitope via different sequences).
+
+---
 
 ### `hdbscan_cluster.py`
 Physicochemical embedding (CDR1+2+3) + UMAP + HDBSCAN density clustering.
@@ -113,8 +186,13 @@ python hdbscan_cluster.py /path/to/csvs \
   --embed-cdrs CDR1 CDR2 CDR3
 ```
 
+---
+
 ### `cluster_enrichment.py`
-Compare two rounds of selection; computes log2(CPM) enrichment with Fisher's exact test and BH FDR correction. Outputs an annotated Excel file, volcano plot, and rank enrichment chart.
+Compare two rounds of selection; computes log2(CPM) enrichment with Fisher's
+exact test and BH FDR correction. Outputs an annotated Excel file, volcano plot,
+and rank enrichment chart. Compatible with consensus files from all three
+clustering methods.
 
 ```bash
 python cluster_enrichment.py R1_consensus.xlsx R2_consensus.xlsx \
@@ -122,6 +200,8 @@ python cluster_enrichment.py R1_consensus.xlsx R2_consensus.xlsx \
   --log2-cutoff 1.0 \
   --fdr-cutoff 0.05
 ```
+
+---
 
 ### `run_pipeline.py`
 Orchestrates all steps.
@@ -147,17 +227,20 @@ python run_pipeline.py \
 
 ## Output files
 
-| File | Description |
-|------|-------------|
-| `*_vhh_dna_protein.csv` | DNA + protein sequences with read counts |
-| `*_vhh_protein_cdr.csv` | CDR1/2/3, liability flags, read counts |
-| `*_cdr3_lengths.png` | CDR3 length distribution histogram |
-| `*_qscore_dist.png` | ONT read Q-score distribution |
-| `*_cluster_consensus.xlsx` | Cluster consensus sequences with physicochemical properties |
-| `VHH_enrichment.xlsx` | Enrichment table with log2, CPM, p-value, FDR |
-| `*_volcano.png` | Volcano plot (log2 enrichment vs −log10 FDR) |
-| `*_rank_enrichment.png` | Rank-ordered enrichment bar chart |
-| `*_summary.json` | Per-BAM read fate statistics |
+| File | Script | Description |
+|------|--------|-------------|
+| `*_vhh_dna_protein.csv` | bam_extract | DNA + protein sequences with read counts |
+| `*_vhh_protein_cdr.csv` | bam_extract | CDR1/2/3, liability flags, read counts |
+| `*_cdr3_lengths.png` | bam_extract | CDR3 length distribution histogram |
+| `*_qscore_dist.png` | bam_extract | ONT read Q-score distribution |
+| `*_summary.json` | bam_extract | Per-BAM read fate statistics |
+| `*_cluster_consensus.xlsx` | blosum / hdbscan | Cluster consensus with physicochemical properties |
+| `*_lev_clonotypes.csv` | levenshtein | Per-sequence clonotype assignments |
+| `*_lev_cluster_consensus.csv` | levenshtein | One row per clonotype with consensus CDR3 |
+| `*_lev_cluster_consensus.xlsx` | levenshtein | Formatted Excel with count heatmap |
+| `VHH_enrichment.xlsx` | enrichment | Enrichment table: log2, CPM, p-value, FDR |
+| `*_volcano.png` | enrichment | Volcano plot (log2 enrichment vs −log10 FDR) |
+| `*_rank_enrichment.png` | enrichment | Rank-ordered enrichment bar chart |
 
 ---
 
@@ -168,6 +251,7 @@ ngs_analysis/
 ├── ngs/                        ← Python virtual environment (not committed)
 ├── bam_extract.py
 ├── cluster_blosum.py
+├── cluster_levenshtein.py
 ├── hdbscan_cluster.py
 ├── cluster_enrichment.py
 ├── run_pipeline.py
@@ -185,7 +269,7 @@ ngs_analysis/
 - Use `--no-trim` in Dorado if VHH primers are part of the amplicon
 - Use HAC or SUP basecalling model (`dna_r10.4.1_e8.2_400bps_hac@v4.3` minimum)
 - Add dual UMIs in library prep for accurate PCR deduplication — enable with `--use-umi`
-- Aim for ≥10,000 reads per barcode post-filtering
+- Aim for ≥ 10,000 reads per barcode post-filtering
 
 ---
 

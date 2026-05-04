@@ -3,16 +3,18 @@
 cluster_enrichment.py — Step 3 of the VHH NGS pipeline.
 
 Compare clustering outputs from two phage display selection rounds and
-compute enrichment scores. Key improvements over original:
+compute enrichment scores.
 
-  • Normalised frequency-based enrichment (CPM) in addition to raw count log2
-  • Fisher's exact test p-value and Benjamini-Hochberg FDR correction
-  • Volcano plot (log2 enrichment vs -log10 FDR)
-  • CDR3 matching by exact identity (preferred) with BLOSUM62 fallback
-  • Clear handling of sequences absent in round 1 (novel enrichment)
+  • CPM-normalised log2 fold change with pseudocount
+  • Two-tailed binomial test (theoretically correct for sequencing count data
+    where only total reads per round are fixed, not per-cluster totals)
+  • Laplace-smoothed expected proportion handles novel clusters (Count_R1=0)
+  • Benjamini-Hochberg FDR correction
+  • 1:1 R1→R2 matching enforced; duplicate fuzzy matches treated as novel
+  • Shannon entropy quality flag for heterogeneous clusters
+  • Volcano plot with bubble size proportional to R2 cluster depth
   • Accepts both CSV and Excel consensus outputs (auto-detects by extension)
-  • Interactive HTML summary report
-  • Configurable significance thresholds
+  • Outputs both Excel (formatted) and CSV (programmatic use)
 """
 
 import sys
@@ -24,9 +26,10 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from scipy.stats import fisher_exact
+from scipy.stats import binomtest
 from statsmodels.stats.multitest import multipletests
-from Bio.Align import PairwiseAligner, substitution_matrices
+from rapidfuzz.distance import Levenshtein
+from rapidfuzz import process as fuzz_process
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -42,29 +45,6 @@ console = Console()
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ALIGNER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _make_aligner() -> PairwiseAligner:
-    aln = PairwiseAligner()
-    aln.substitution_matrix = substitution_matrices.load("BLOSUM62")
-    aln.open_gap_score   = -10
-    aln.extend_gap_score = -0.5
-    aln.mode = "global"
-    return aln
-
-
-def blosum_similarity(seq1: str, seq2: str, aligner: PairwiseAligner) -> float:
-    if not seq1 or not seq2:
-        return 0.0
-    score       = aligner.score(seq1, seq2)
-    self_score1 = aligner.score(seq1, seq1)
-    self_score2 = aligner.score(seq2, seq2)
-    denom       = max(self_score1, self_score2)
-    return score / denom if denom > 0 else 0.0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # CDR3 MATCHING
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -78,62 +58,74 @@ def match_cdr3(
     query:     str,
     lookup:    dict,
     ref_seqs:  list,
-    aligner:   PairwiseAligner,
-    threshold: float = 0.90,
+    threshold: float = 0.85,
     use_fuzzy: bool  = True,
 ) -> Optional[str]:
     """
-    Try exact match first; fall back to BLOSUM62 similarity.
-    Returns matched CDR3 string or None.
+    Try exact match first; fall back to normalised Levenshtein similarity via
+    rapidfuzz (SIMD-accelerated). extractOne applies score_cutoff for early exit,
+    making this O(n) with a small constant vs O(n * L^2) for BLOSUM alignment.
     """
     q = str(query).upper().strip()
     if q in lookup:
-        return q                         # exact hit
+        return q
 
     if not use_fuzzy:
         return None
 
-    best_score, best_seq = 0.0, None
-    for ref in ref_seqs:
-        sim = blosum_similarity(q, ref, aligner)
-        if sim > best_score:
-            best_score, best_seq = sim, ref
-    return best_seq if best_score >= threshold else None
+    result = fuzz_process.extractOne(
+        q, ref_seqs,
+        scorer=Levenshtein.normalized_similarity,
+        score_cutoff=threshold,
+    )
+    return result[0] if result else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STATISTICS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_enrichment(df: pd.DataFrame) -> pd.DataFrame:
+def compute_enrichment(df: pd.DataFrame, min_r2_count: int = 0) -> pd.DataFrame:
     """
-    Add enrichment metrics:
-      - CPM_R1, CPM_R2  (counts per million, for normalised comparison)
-      - Log2_Enrichment (log2 CPM_R2 / CPM_R1, pseudocount-corrected)
-      - Pvalue          (Fisher's exact test)
-      - FDR             (Benjamini-Hochberg corrected p-value)
+    Add enrichment metrics using the binomial test.
+
+    The binomial test is correct for sequencing data: only total reads per
+    round are experimentally fixed (row totals), not total reads per cluster
+    (column totals). Fisher's exact conditions on both margins and is therefore
+    misspecified here.
+
+    Laplace smoothing ((c1+0.5)/(total_r1+0.5)) gives a sensible expected
+    proportion for novel clusters (Count_R1=0) and avoids degenerate p=0.
+
+    Library totals are computed before min_r2_count filtering so the reference
+    denominator is stable across thresholds.
     """
     pseudocount = 0.5
 
-    total_r1 = df["Count_R1"].sum() + pseudocount * len(df)
-    total_r2 = df["Count_R2"].sum() + pseudocount * len(df)
-
-    df["CPM_R1"] = (df["Count_R1"] + pseudocount) / total_r1 * 1e6
-    df["CPM_R2"] = (df["Count_R2"] + pseudocount) / total_r2 * 1e6
-    df["Log2_Enrichment"] = np.log2(df["CPM_R2"] / df["CPM_R1"])
-
-    # Fisher's exact: [[R2_count, R2_total - R2_count], [R1_count, R1_total - R1_count]]
-    pvals = []
+    # Stable library totals — computed before filtering
     total_r1_int = int(df["Count_R1"].sum())
     total_r2_int = int(df["Count_R2"].sum())
 
+    if min_r2_count > 0:
+        df = df[df["Count_R2"] >= min_r2_count].copy().reset_index(drop=True)
+
+    # CPM: pseudocount prevents log(0); uses the same stable totals
+    n = len(df)
+    total_r1_cpm = total_r1_int + pseudocount * n
+    total_r2_cpm = total_r2_int + pseudocount * n
+
+    df["CPM_R1"] = (df["Count_R1"] + pseudocount) / total_r1_cpm * 1e6
+    df["CPM_R2"] = (df["Count_R2"] + pseudocount) / total_r2_cpm * 1e6
+    df["Log2_Enrichment"] = np.log2(df["CPM_R2"] / df["CPM_R1"])
+
+    # Two-tailed binomial test: detects both enrichment and depletion
+    pvals = []
     for _, row in df.iterrows():
         c2 = int(row["Count_R2"])
         c1 = int(row["Count_R1"])
-        table = [[c2, max(total_r2_int - c2, 0)],
-                 [c1, max(total_r1_int - c1, 0)]]
-        _, p = fisher_exact(table, alternative="greater")
-        pvals.append(p)
+        p_expected = (c1 + pseudocount) / (total_r1_int + pseudocount)
+        result = binomtest(c2, total_r2_int, p=p_expected, alternative="two-sided")
+        pvals.append(result.pvalue)
 
     df["Pvalue"] = pvals
     _, fdrs, _, _ = multipletests(pvals, alpha=0.05, method="fdr_bh")
@@ -149,30 +141,34 @@ def compute_enrichment(df: pd.DataFrame) -> pd.DataFrame:
 
 def plot_volcano(df: pd.DataFrame, output_path: Path,
                  log2_threshold: float = 1.0, fdr_threshold: float = 0.05):
-    """Volcano plot: log2 enrichment vs -log10 FDR."""
-    enriched  = (df["Log2_Enrichment"] >= log2_threshold) & (df["FDR"] < fdr_threshold)
-    depleted  = (df["Log2_Enrichment"] <= -log2_threshold) & (df["FDR"] < fdr_threshold)
-    neutral   = ~enriched & ~depleted
+    """Volcano plot: log2 enrichment vs -log10 FDR. Dot size = sqrt(R2 count)."""
+    enriched = (df["Log2_Enrichment"] >= log2_threshold) & (df["FDR"] < fdr_threshold)
+    depleted = (df["Log2_Enrichment"] <= -log2_threshold) & (df["FDR"] < fdr_threshold)
+    neutral  = ~enriched & ~depleted
+
+    def _sizes(mask):
+        return np.sqrt(df.loc[mask, "Count_R2"].clip(lower=1)).clip(5, 60)
 
     fig, ax = plt.subplots(figsize=(9, 7))
     ax.scatter(df.loc[neutral,  "Log2_Enrichment"], df.loc[neutral,  "Neg_log10_FDR"],
-               c="grey",   alpha=0.5, s=20, label="Not significant")
+               c="grey",   alpha=0.4, s=_sizes(neutral),  label="Not significant")
     ax.scatter(df.loc[enriched, "Log2_Enrichment"], df.loc[enriched, "Neg_log10_FDR"],
-               c="#d62728", alpha=0.8, s=30, label=f"Enriched (n={enriched.sum()})")
+               c="#d62728", alpha=0.8, s=_sizes(enriched), label=f"Enriched (n={enriched.sum()})")
     ax.scatter(df.loc[depleted, "Log2_Enrichment"], df.loc[depleted, "Neg_log10_FDR"],
-               c="#1f77b4", alpha=0.8, s=30, label=f"Depleted (n={depleted.sum()})")
+               c="#1f77b4", alpha=0.8, s=_sizes(depleted), label=f"Depleted (n={depleted.sum()})")
 
-    ax.axvline(log2_threshold,  color="red",  linestyle="--", linewidth=0.8, alpha=0.7)
-    ax.axvline(-log2_threshold, color="blue", linestyle="--", linewidth=0.8, alpha=0.7)
+    ax.axvline(log2_threshold,  color="red",   linestyle="--", linewidth=0.8, alpha=0.7)
+    ax.axvline(-log2_threshold, color="blue",  linestyle="--", linewidth=0.8, alpha=0.7)
     ax.axhline(-np.log10(fdr_threshold), color="green", linestyle="--",
                linewidth=0.8, alpha=0.7, label=f"FDR={fdr_threshold}")
 
-    # Label top 10 enriched
-    top = df[enriched].nlargest(10, "Log2_Enrichment")
-    for _, row in top.iterrows():
-        ax.annotate(str(row.get("CDR3", ""))[:12],
-                    (row["Log2_Enrichment"], row["Neg_log10_FDR"]),
-                    fontsize=6, ha="left", va="bottom", alpha=0.8)
+    # Label top 10 enriched and top 5 depleted
+    for sub_df in [df[enriched].nlargest(10, "Log2_Enrichment"),
+                   df[depleted].nsmallest(5, "Log2_Enrichment")]:
+        for _, row in sub_df.iterrows():
+            ax.annotate(str(row.get("CDR3", ""))[:12],
+                        (row["Log2_Enrichment"], row["Neg_log10_FDR"]),
+                        fontsize=6, ha="left", va="bottom", alpha=0.8)
 
     ax.set_xlabel("log₂(Enrichment)", fontsize=12)
     ax.set_ylabel("-log₁₀(FDR)", fontsize=12)
@@ -247,23 +243,23 @@ def _read_consensus(filepath: str) -> pd.DataFrame:
 
 
 def calculate_enrichment(
-    file_r1:     str,
-    file_r2:     str,
-    output_file: str = "VHH_enrichment.xlsx",
-    threshold:   float = 0.90,
-    use_fuzzy:   bool  = True,
-    log2_cutoff: float = 1.0,
-    fdr_cutoff:  float = 0.05,
+    file_r1:      str,
+    file_r2:      str,
+    output_file:  str   = "VHH_enrichment.xlsx",
+    threshold:    float = 0.85,
+    use_fuzzy:    bool  = True,
+    log2_cutoff:  float = 1.0,
+    fdr_cutoff:   float = 0.05,
+    min_r2_count: int   = 0,
+    entropy_flag: float = 1.5,
 ) -> pd.DataFrame:
 
     df_r1 = _read_consensus(file_r1)
     df_r2 = _read_consensus(file_r2)
 
-    # Normalise columns
     for df in [df_r1, df_r2]:
         df.columns = df.columns.str.strip()
 
-    # Check required columns
     for name, df in [("R1", df_r1), ("R2", df_r2)]:
         missing = [c for c in ["CDR3", "Cluster_Count"] if c not in df.columns]
         if missing:
@@ -272,30 +268,38 @@ def calculate_enrichment(
 
     console.print(f"  R1 clusters: {len(df_r1):,}  |  R2 clusters: {len(df_r2):,}")
 
-    aligner   = _make_aligner()
     lookup_r1 = build_exact_lookup(df_r1, "CDR3")
     seqs_r1   = list(lookup_r1.keys())
 
-    # ── Match each R2 sequence to R1 ──────────────────────────────────────────
+    # ── Match each R2 cluster to R1 (1:1 enforced) ───────────────────────────
+    # Greedy first-match: once an R1 CDR3 is claimed, subsequent R2 clusters
+    # that would fuzzy-match the same R1 sequence are treated as novel.
+    # Prevents shared-R1-count inflation across multiple R2 clusters.
+    claimed_r1: set = set()
     rows = []
+
     for _, row_r2 in df_r2.iterrows():
         cdr3_r2 = str(row_r2["CDR3"]).upper().strip()
         matched = match_cdr3(cdr3_r2, lookup_r1, seqs_r1,
-                             aligner, threshold, use_fuzzy)
+                             threshold, use_fuzzy)
+
+        if matched is not None and matched in claimed_r1:
+            matched = None   # R1 already consumed by a better-ranked R2 cluster
 
         if matched is not None:
-            r1_row    = df_r1.iloc[lookup_r1[matched]]
-            count_r1  = int(r1_row["Cluster_Count"])
-            meta_r1   = {f"{c}_R1": r1_row[c] for c in df_r1.columns
-                         if c not in ["CDR3", "Cluster_Count"]}
+            claimed_r1.add(matched)
+            r1_row   = df_r1.iloc[lookup_r1[matched]]
+            count_r1 = int(r1_row["Cluster_Count"])
+            meta_r1  = {f"{c}_R1": r1_row[c] for c in df_r1.columns
+                        if c not in ["CDR3", "Cluster_Count"]}
         else:
-            count_r1  = 0          # novel — absent in R1
-            meta_r1   = {}
+            count_r1 = 0
+            meta_r1  = {}
 
         combined = {
-            "CDR3":      cdr3_r2,
-            "Count_R1":  count_r1,
-            "Count_R2":  int(row_r2["Cluster_Count"]),
+            "CDR3":       cdr3_r2,
+            "Count_R1":   count_r1,
+            "Count_R2":   int(row_r2["Cluster_Count"]),
             "Match_Type": "exact" if cdr3_r2 in lookup_r1 else ("fuzzy" if matched else "novel"),
             **{f"{c}_R2": row_r2[c] for c in df_r2.columns
                if c not in ["CDR3", "Cluster_Count"]},
@@ -304,7 +308,14 @@ def calculate_enrichment(
         rows.append(combined)
 
     merged = pd.DataFrame(rows)
-    merged = compute_enrichment(merged)
+    merged = compute_enrichment(merged, min_r2_count=min_r2_count)
+
+    # ── Shannon entropy quality flag ──────────────────────────────────────────
+    if "Shannon_Entropy_R2" in merged.columns:
+        merged["Quality_Flag"] = np.where(
+            merged["Shannon_Entropy_R2"] > entropy_flag, "heterogeneous",
+            np.where(merged["Count_R2"] < 20, "low_depth", "")
+        )
 
     # ── Outputs ───────────────────────────────────────────────────────────────
     out_path = Path(output_file)
@@ -312,6 +323,11 @@ def calculate_enrichment(
     stem     = out_path.stem
 
     write_enrichment_excel(merged, out_path)
+
+    csv_path = out_path.with_suffix(".csv")
+    merged.to_csv(csv_path, index=False)
+    console.print(f"[green]✓ Enrichment CSV:[/green] {csv_path}")
+
     plot_volcano(merged, out_dir / f"{stem}_volcano.png",
                  log2_threshold=log2_cutoff, fdr_threshold=fdr_cutoff)
     plot_rank_enrichment(merged, out_dir / f"{stem}_rank_enrichment.png")
@@ -347,15 +363,20 @@ def main():
     parser.add_argument("file_r1",    help="Round 1 cluster consensus file (.csv or .xlsx)")
     parser.add_argument("file_r2",    help="Round 2 cluster consensus file (.csv or .xlsx)")
     parser.add_argument("--output",   default="VHH_enrichment.xlsx",
-                        help="Output Excel filename")
-    parser.add_argument("--threshold", type=float, default=0.90,
-                        help="BLOSUM62 similarity threshold for fuzzy CDR3 matching (default: 0.90)")
+                        help="Output Excel filename (a matching .csv is always written too)")
+    parser.add_argument("--threshold", type=float, default=0.85,
+                        help="Normalised Levenshtein similarity threshold for fuzzy CDR3 matching (default: 0.85)")
     parser.add_argument("--no-fuzzy", action="store_true",
                         help="Disable fuzzy matching; exact CDR3 only")
     parser.add_argument("--log2-cutoff", type=float, default=1.0,
                         help="Log2 enrichment cutoff for volcano (default: 1.0)")
     parser.add_argument("--fdr-cutoff",  type=float, default=0.05,
                         help="FDR cutoff for significance (default: 0.05)")
+    parser.add_argument("--min-r2-count", type=int, default=0,
+                        help="Exclude R2 clusters with fewer than N total reads (default: 0 = off)")
+    parser.add_argument("--entropy-flag", type=float, default=1.5,
+                        help="Shannon entropy above which clusters are flagged as heterogeneous "
+                             "(default: 1.5 bits; requires Shannon_Entropy column in R2 input)")
     args = parser.parse_args()
 
     if not os.path.exists(args.file_r1) or not os.path.exists(args.file_r2):
@@ -369,6 +390,8 @@ def main():
         use_fuzzy=not args.no_fuzzy,
         log2_cutoff=args.log2_cutoff,
         fdr_cutoff=args.fdr_cutoff,
+        min_r2_count=args.min_r2_count,
+        entropy_flag=args.entropy_flag,
     )
 
 

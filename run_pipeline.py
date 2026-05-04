@@ -8,7 +8,8 @@ Usage examples:
     --bam-dir /data/round2/ \\
     --r1-consensus /data/round1/R1_cluster_consensus.csv \\
     --min-q 12 \\
-    --cdr-method anarci
+    --cdr-method anarci \\
+    --min-r2-count 10
 
   # Extract + cluster only (no enrichment)
   python run_pipeline.py \\
@@ -100,6 +101,8 @@ def run_enrichment(r1_file, r2_file, args):
         use_fuzzy=not args.no_fuzzy,
         log2_cutoff=args.log2_cutoff,
         fdr_cutoff=args.fdr_cutoff,
+        min_r2_count=args.min_r2_count,
+        entropy_flag=args.entropy_flag,
     )
 
 
@@ -139,10 +142,15 @@ def main():
     p.add_argument("--r2-consensus",  help="Round 2 cluster consensus .csv (enrich-only mode)")
     p.add_argument("--enrich-output", default="VHH_enrichment.xlsx",
                    help="Output enrichment Excel path (default: VHH_enrichment.xlsx)")
-    p.add_argument("--match-threshold", type=float, default=0.90)
+    p.add_argument("--match-threshold", type=float, default=0.85,
+                   help="Levenshtein similarity threshold for fuzzy CDR3 matching (default: 0.85)")
     p.add_argument("--no-fuzzy",  action="store_true")
-    p.add_argument("--log2-cutoff", type=float, default=1.0)
-    p.add_argument("--fdr-cutoff",  type=float, default=0.05)
+    p.add_argument("--log2-cutoff",   type=float, default=1.0)
+    p.add_argument("--fdr-cutoff",    type=float, default=0.05)
+    p.add_argument("--min-r2-count",  type=int,   default=0,
+                   help="Exclude R2 clusters with fewer than N reads from enrichment (default: 0)")
+    p.add_argument("--entropy-flag",  type=float, default=1.5,
+                   help="Shannon entropy threshold for heterogeneous cluster flag (default: 1.5)")
 
     args = p.parse_args()
 

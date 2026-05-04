@@ -26,7 +26,7 @@ pre-aligned to IMGT Vicugna IGHV germlines
           │
           ▼
   cluster_enrichment.py       Step 3 — log2 CPM enrichment (R1 vs R2),
-                              Fisher's exact test + BH FDR correction
+                              two-tailed binomial test + BH FDR correction
                               → VHH_enrichment.xlsx + volcano/rank plots
 ```
 
@@ -50,7 +50,8 @@ python run_pipeline.py \
   --bam-dir /data/R2/ \
   --r1-consensus /data/R1/R1_cluster_consensus.csv \
   --min-q 12 \
-  --threshold 0.85
+  --threshold 0.85 \
+  --min-r2-count 10
 ```
 
 ---
@@ -164,15 +165,18 @@ python cluster_levenshtein.py \
 
 ### `cluster_enrichment.py` — Step 3
 
-Compares Round 1 vs Round 2 cluster consensus files. Computes log2(CPM) enrichment, Fisher's exact test p-values, and Benjamini-Hochberg FDR correction. Outputs an annotated Excel file plus volcano and rank-enrichment plots.
+Compares Round 1 vs Round 2 cluster consensus files. Computes log2(CPM) enrichment, two-tailed binomial test p-values, and Benjamini-Hochberg FDR correction. Outputs an annotated Excel file, a matching CSV, and volcano and rank-enrichment plots.
 
-Accepts `.csv` or `.xlsx` consensus input. Matches clusters by exact CDR3 identity first, falling back to BLOSUM62 similarity for near-identical sequences.
+**Statistical approach:** Uses a two-tailed binomial test, which is the correct model for sequencing proportion data where only total reads per round are experimentally fixed (not total reads per cluster). Laplace smoothing `(c1+0.5)/(total_r1+0.5)` gives a well-behaved expected proportion for clusters absent in R1. CPM pseudocount (0.5) is used only for fold-change estimation and is independent of the significance test.
+
+Accepts `.csv` or `.xlsx` consensus input. Matches clusters by exact CDR3 identity first, falling back to normalised Levenshtein similarity (rapidfuzz, SIMD-accelerated). 1:1 matching is enforced — if multiple R2 clusters fuzzy-match the same R1 cluster, the first (highest-ranked) match wins and the rest are treated as novel, preventing shared-count inflation.
 
 ```bash
 python cluster_enrichment.py \
   R1_cluster_consensus.csv \
   R2_cluster_consensus.csv \
   --output VHH_enrichment.xlsx \
+  --min-r2-count 10 \
   --log2-cutoff 1.0 \
   --fdr-cutoff 0.05
 ```
@@ -181,11 +185,21 @@ python cluster_enrichment.py \
 |------|---------|-------------|
 | `file_r1` | — | Round 1 consensus file (.csv or .xlsx) |
 | `file_r2` | — | Round 2 consensus file (.csv or .xlsx) |
-| `--output` | VHH_enrichment.xlsx | Output Excel path |
-| `--threshold` | 0.90 | BLOSUM similarity for fuzzy CDR3 matching |
+| `--output` | VHH_enrichment.xlsx | Output Excel path (a matching .csv is always written) |
+| `--threshold` | 0.85 | Normalised Levenshtein similarity for fuzzy CDR3 matching |
 | `--no-fuzzy` | off | Exact CDR3 matching only |
 | `--log2-cutoff` | 1.0 | log2 enrichment cutoff for volcano |
 | `--fdr-cutoff` | 0.05 | FDR significance threshold |
+| `--min-r2-count` | 0 | Exclude R2 clusters with fewer than N reads (reduces multiple-testing burden) |
+| `--entropy-flag` | 1.5 | Shannon entropy above which a cluster is flagged as `heterogeneous` in `Quality_Flag` column |
+
+**Quality_Flag column** (present when `Shannon_Entropy` is in the R2 input):
+
+| Value | Meaning |
+|-------|---------|
+| `heterogeneous` | Shannon entropy > `--entropy-flag`; cluster contains many divergent CDR3s |
+| `low_depth` | R2 cluster has < 20 total reads; fold change is unreliable |
+| _(empty)_ | No quality concern |
 
 ---
 
@@ -221,7 +235,8 @@ python run_pipeline.py \
 | `*_summary.json` | 1 | Per-BAM read fate statistics |
 | `*_clonotypes.csv` | 2 | Per-sequence clonotype assignments + Cluster_Count |
 | `*_cluster_consensus.csv` | 2 | One row per clonotype; Count-weighted consensus + biophysics |
-| `VHH_enrichment.xlsx` | 3 | Enrichment table: log2, CPM, p-value, FDR |
+| `VHH_enrichment.xlsx` | 3 | Enrichment table: log2, CPM, p-value, FDR (colour-formatted) |
+| `VHH_enrichment.csv` | 3 | Same table as CSV for programmatic use |
 | `*_volcano.png` | 3 | Volcano plot (log2 enrichment vs −log10 FDR) |
 | `*_rank_enrichment.png` | 3 | Rank-ordered enrichment bar chart |
 

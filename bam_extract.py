@@ -215,6 +215,7 @@ def _anarci_chunk(proteins: List[str]) -> List[Tuple[str, str, str]]:
             scheme="imgt",
             output=False,
             allow={"H"},
+            allowed_species=["alpaca"],
         )
         cdrs = []
         for i, result_tuple in enumerate(results):

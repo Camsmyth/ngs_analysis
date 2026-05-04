@@ -59,17 +59,17 @@ console = Console()
 # ══════════════════════════════════════════════════════════════════════════════
 
 def calc_biophysical(seq: str) -> dict:
-    empty = {"pI": "", "GRAVY": "", "Charge_pH7": "", "Aromaticity": "", "MW_kDa": ""}
+    empty = {"pI": "", "MW_kDa": "", "Charge_pH74": "", "Aromaticity": "", "GRAVY": ""}
     if not seq or len(seq) < 4:
         return empty
     try:
         pa = ProteinAnalysis(seq.replace("-", "").replace("*", ""))
         return {
-            "pI":          round(pa.isoelectric_point(), 2),
-            "GRAVY":       round(pa.gravy(), 3),
-            "Charge_pH7":  round(pa.charge_at_pH(7.0), 2),
-            "Aromaticity": round(pa.aromaticity(), 3),
-            "MW_kDa":      round(pa.molecular_weight() / 1000, 2),
+            "pI":           round(pa.isoelectric_point(), 2),
+            "MW_kDa":       round(pa.molecular_weight() / 1000, 2),
+            "Charge_pH74":  round(pa.charge_at_pH(7.4), 2),
+            "Aromaticity":  round(pa.aromaticity(), 3),
+            "GRAVY":        round(pa.gravy(), 3),
         }
     except Exception:
         return empty
@@ -312,17 +312,20 @@ def run_levenshtein_clustering(
         else:
             rep_row = sub.iloc[0]
 
-        # CDR columns from representative row
-        cdr1 = rep_row["CDR1"] if "CDR1" in rep_row.index else ""
-        cdr2 = rep_row["CDR2"] if "CDR2" in rep_row.index else ""
-        cdr_concat = rep_row["CDR_Concatenated"] if "CDR_Concatenated" in rep_row.index else ""
+        # Columns from representative (highest-Count) row
+        def _str(val) -> str:
+            return str(val) if pd.notna(val) and str(val) not in ("", "nan") else ""
 
-        # Per-CDR lengths from representative
-        cdr1_len = len(str(cdr1)) if cdr1 and str(cdr1) not in ("", "nan") else ""
-        cdr2_len = len(str(cdr2)) if cdr2 and str(cdr2) not in ("", "nan") else ""
+        cdr1       = _str(rep_row.get("CDR1", ""))
+        cdr2       = _str(rep_row.get("CDR2", ""))
+        cdr_concat = _str(rep_row.get("CDR_Concatenated", ""))
+        protein    = _str(rep_row.get("Protein_Sequence", ""))
+
+        cdr1_len = len(cdr1) if cdr1 else ""
+        cdr2_len = len(cdr2) if cdr2 else ""
         cdr3_len = len(consensus)
 
-        # Liabilities: union of unique flags across all cluster members
+        # Liabilities: union of CDR liability flags across all cluster members
         if "Liabilities" in sub.columns:
             all_liab = set()
             for v in sub["Liabilities"].dropna():
@@ -332,30 +335,30 @@ def run_levenshtein_clustering(
         else:
             liabilities = "None"
 
-        # Biophysical metrics on CDR_Concatenated consensus
-        biophys = calc_biophysical(str(cdr_concat) if cdr_concat and str(cdr_concat) not in ("", "nan") else "")
+        # Biophysical metrics on the full VHH protein sequence
+        biophys = calc_biophysical(protein)
 
         row = {
-            "Cluster":            cid,
-            "CDR3":               consensus,
-            "CDR1":               cdr1,
-            "CDR2":               cdr2,
-            "CDR_Concatenated":   cdr_concat,
+            "Cluster":             cid,
+            "CDR3":                consensus,
+            "CDR1":                cdr1,
+            "CDR2":                cdr2,
+            "CDR_Concatenated":    cdr_concat,
+            "Protein_Sequence":    protein,
             "Representative_CDR3": rep_row[seq_column],
-            "Cluster_Count":      int(total_cnt),   # total reads (sum of Count)
-            "Unique_Sequences":   n_unique,         # distinct CDR3 strings in cluster
-
-            "Mean_CDR3_Length":   mean_len,
-            "CDR1_Length":        cdr1_len,
-            "CDR2_Length":        cdr2_len,
-            "CDR3_Length":        cdr3_len,
-            "Shannon_Entropy":    round(entropy, 3),
-            "pI":                 biophys["pI"],
-            "GRAVY":              biophys["GRAVY"],
-            "Charge_pH7":         biophys["Charge_pH7"],
-            "Aromaticity":        biophys["Aromaticity"],
-            "MW_kDa":             biophys["MW_kDa"],
-            "Liabilities":        liabilities,
+            "Cluster_Count":       int(total_cnt),   # total reads (sum of Count)
+            "Unique_Sequences":    n_unique,          # distinct CDR3 strings in cluster
+            "Mean_CDR3_Length":    mean_len,
+            "CDR1_Length":         cdr1_len,
+            "CDR2_Length":         cdr2_len,
+            "CDR3_Length":         cdr3_len,
+            "Shannon_Entropy":     round(entropy, 3),
+            "pI":                  biophys["pI"],
+            "MW_kDa":              biophys["MW_kDa"],
+            "Charge_pH74":         biophys["Charge_pH74"],
+            "Aromaticity":         biophys["Aromaticity"],
+            "GRAVY":               biophys["GRAVY"],
+            "Liabilities":         liabilities,
         }
 
         consensus_rows.append(row)

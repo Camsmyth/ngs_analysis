@@ -12,6 +12,8 @@ hdbscan>=0.8.33
 scipy>=1.11
 scikit-learn>=1.4
 umap-learn>=0.5      # optional but strongly recommended for HDBSCAN
+rapidfuzz>=3.0       # SIMD-accelerated Levenshtein for cluster_levenshtein.py
+networkx>=3.0        # graph-based clonotyping for cluster_levenshtein.py
 
 # Statistics
 statsmodels>=0.14    # BH FDR correction

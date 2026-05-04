@@ -104,6 +104,8 @@ required = [
     ("openpyxl",      "openpyxl"),
     ("rich",          "rich"),
     ("tqdm",          "tqdm"),
+    ("rapidfuzz",     "rapidfuzz"),
+    ("networkx",      "networkx"),
 ]
 failed = []
 for mod, pkg in required:
@@ -133,6 +135,7 @@ echo ""
 echo "  Run individual steps:"
 echo "    python bam_extract.py <bam_dir> --min-q 12 --cdr-method anarci"
 echo "    python cluster_blosum.py --input <csv> --threshold 30"
+echo "    python cluster_levenshtein.py --input <csv> --threshold 0.85"
 echo "    python hdbscan_cluster.py <dir> --min-cluster-counts 10"
 echo "    python cluster_enrichment.py <R1.xlsx> <R2.xlsx>"
 echo ""

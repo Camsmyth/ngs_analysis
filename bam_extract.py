@@ -16,6 +16,7 @@ sequences — making it robust to variation in library prep primers.
   • Rich progress display and structured JSON summary
 """
 
+import os
 import pysam
 import regex as re
 import csv
@@ -23,6 +24,7 @@ import json
 import shutil
 import argparse
 from collections import defaultdict, Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Tuple
 

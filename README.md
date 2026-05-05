@@ -14,9 +14,7 @@ pre-aligned to IMGT Vicugna IGHV germlines
           │
           ▼
   bam_extract.py              Step 1 — alignment filter, FR1/J4 anchor extraction,
-                              batched ANARCI CDR annotation, quality filtering;
-                              parallel BAM processing (--workers) + optional GPU
-                              Q-score batching via CuPy (--gpu)
+                              ANARCI CDR annotation, quality filtering
                               → *_vhh_protein_cdr.csv  (unique proteins + read Counts)
           │
           ▼
@@ -83,10 +81,18 @@ All Python dependencies installed by `setup.sh`.
 ### `bam_extract.py` — Step 1
 
 Extracts VHH sequences from BAM files aligned to IMGT Vicugna germlines.
+Designed for millions of reads across 10+ BAM files.
 
-**Approach:** Uses the BAM alignment as a pre-filter (mapped reads only, ~95% of reads for a typical VHH library), then locates the VHH coding region using conserved framework motifs — FR1 start (`CAGGTGCAGCTG`) and J4 end (`ACCCAGGTCACC`) — independently of the PCR primers used in library prep. Strand-agnostic. CDR1/2/3 extracted and numbered by ANARCI (IMGT scheme).
+**Extraction approach:**
+Uses the Dorado/minimap2 alignment coordinates directly — CIGAR arithmetic locates the VHH coding region on the reference without any per-read regex search. Insertions within the amplicon window are included in the extracted sequence; deletions are absent, preserving correct length for all three translation frames. Reads whose alignment does not fully cover the reference window `[--ref-vhh-start, --ref-vhh-end)` (e.g. partial alignments at library ends) fall back to fuzzy FR1/J4 motif search.
 
-**Output:** One row per unique protein sequence with a `Count` column (number of ONT reads). This Count propagates through all downstream steps and drives consensus weighting.
+**Deduplication before annotation:**
+Unique DNA amplicons are counted across all reads in pass 1. Translation and ANARCI CDR annotation run only once per unique sequence — not once per read — dramatically reducing work on high-depth libraries. ANARCI is called in batches (`--anarci-batch`) to amortise hmmer subprocess overhead.
+
+**Parallelism:**
+Multiple BAM files are processed in parallel worker processes (`--workers`). Default is one worker per BAM up to the available CPU count.
+
+**Output:** One row per unique protein sequence with a `Count` column (total ONT reads). This Count propagates through all downstream steps and drives consensus weighting.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -95,19 +101,19 @@ Extracts VHH sequences from BAM files aligned to IMGT Vicugna germlines.
 | `--max-len` | 1000 | Maximum read length (bp) |
 | `--cdr-method` | anarci | CDR extraction: `anarci` or `offset` |
 | `--use-umi` | off | Enable UMI deduplication (Dorado `UX` tag) |
-| `--fr1` | CAGGTGCAGCTG | FR1 anchor motif |
-| `--j4` | ACCCAGGTCACC | J4 anchor motif |
-| `--fr-mm` | 2 | Fuzzy mismatch tolerance |
-| `--workers` | 1 | Parallel BAM workers; each BAM runs in its own subprocess |
-| `--gpu` | off | GPU Q-score batching via CuPy (`pip install cupy-cuda11x`) |
+| `--ref-vhh-start` | 0 | Reference start of VHH amplicon window |
+| `--ref-vhh-end` | 390 | Reference end of VHH amplicon window |
+| `--fr1` | CAGGTGCAGCTG | FR1 motif for fallback search |
+| `--j4` | ACCCAGGTCACC | J4 motif for fallback search |
+| `--fr-mm` | 2 | Fuzzy mismatch tolerance for motif fallback |
+| `--workers` | #BAMs | Parallel BAM worker processes |
+| `--anarci-batch` | 5000 | Proteins per ANARCI batch call |
 
 ```bash
-# Single BAM directory, 4 parallel workers
-python bam_extract.py /path/to/bams/ --min-q 12 --workers 4
-
-# GPU-accelerated Q-score batching (requires CuPy)
-python bam_extract.py /path/to/bams/ --min-q 12 --workers 4 --gpu
+python bam_extract.py /path/to/bams/ --min-q 12 --workers 10
 ```
+
+The summary table printed at the end shows **CIGAR path** vs **Motif fallback** counts per file. A high motif-fallback rate (>10%) suggests the `--ref-vhh-end` value may need adjusting for your reference.
 
 ---
 

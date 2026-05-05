@@ -35,6 +35,8 @@ console = Console()
 def run_extraction(args):
     console.print(Rule("[bold cyan]Step 1 — BAM Extraction[/bold cyan]"))
     from bam_extract import process_bam, DEFAULT_CONFIG
+    import os
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     input_dir  = Path(args.bam_dir)
     output_dir = input_dir / "BAM_extract"
@@ -50,19 +52,41 @@ def run_extraction(args):
         "MIN_VHH_AA_LENGTH": args.min_aa,
         "CDR_METHOD":        args.cdr_method,
         "USE_UMI":           args.use_umi,
+        "ANARCI_BATCH_SIZE": args.anarci_batch,
     }
 
-    bam_files = list(input_dir.glob("*.bam"))
+    bam_files = sorted(input_dir.glob("*.bam"))
     if not bam_files:
         console.print(f"[red]No .bam files found in {input_dir}[/red]")
         sys.exit(1)
 
+    n_workers = args.workers or min(len(bam_files), os.cpu_count() or 1)
     protein_cdr_files = []
-    for bam in bam_files:
+
+    def _collect(bam):
         summary = process_bam(bam, output_dir, config)
         pf = input_dir / f"{bam.stem}_vhh_protein_cdr.csv"
-        if pf.exists():
-            protein_cdr_files.append(pf)
+        return pf if pf.exists() else None
+
+    if n_workers == 1 or len(bam_files) == 1:
+        for bam in bam_files:
+            pf = _collect(bam)
+            if pf:
+                protein_cdr_files.append(pf)
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(process_bam, bam, output_dir, config): bam
+                       for bam in bam_files}
+            for future in as_completed(futures):
+                bam = futures[future]
+                try:
+                    future.result()
+                    pf = input_dir / f"{bam.stem}_vhh_protein_cdr.csv"
+                    if pf.exists():
+                        protein_cdr_files.append(pf)
+                except Exception as exc:
+                    console.print(f"[red]Error processing {bam.name}: {exc}[/red]")
+
     return protein_cdr_files
 
 
@@ -127,6 +151,10 @@ def main():
     p.add_argument("--min-aa",   type=int,   default=100)
     p.add_argument("--cdr-method", default="anarci", choices=["anarci", "offset"])
     p.add_argument("--use-umi",  action="store_true")
+    p.add_argument("--workers",       type=int, default=0,
+                   help="Parallel BAM worker processes (default: one per BAM)")
+    p.add_argument("--anarci-batch",  type=int, default=5000,
+                   help="Proteins per ANARCI batch call (default: 5000)")
 
     # ── Clustering ────────────────────────────────────────────────────────────
     p.add_argument("--threshold",        type=float, default=0.85,

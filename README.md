@@ -83,8 +83,12 @@ All Python dependencies installed by `setup.sh`.
 Extracts VHH sequences from BAM files aligned to IMGT Vicugna germlines.
 Designed for millions of reads across 10+ BAM files.
 
-**Extraction approach:**
-Uses the Dorado/minimap2 alignment coordinates directly — CIGAR arithmetic locates the VHH coding region on the reference without any per-read regex search. Insertions within the amplicon window are included in the extracted sequence; deletions are absent, preserving correct length for all three translation frames. Reads whose alignment does not fully cover the reference window `[--ref-vhh-start, --ref-vhh-end)` (e.g. partial alignments at library ends) fall back to fuzzy FR1/J4 motif search.
+**Extraction approach (three-tier):**
+1. **Aligned region search** — searches `query_alignment_sequence` (the soft-clip-stripped aligned region). Already in reference/coding orientation for both strands; no reverse complement needed. Fast for reads where both FR1 and J4 fall within the aligned span.
+2. **Full read forward search** — searches the complete `query_sequence` (including soft clips) on the forward strand. Needed when J4 is soft-clipped beyond the alignment end, which is common when the reference has flanking sequence before FR1.
+3. **RC fallback** — reverse complement search for the rare genuinely antisense read (<1% in practice).
+
+All motif searches try an exact `str.find` first; fuzzy regex only fires on mismatches, keeping high-Q-score reads fast.
 
 **Deduplication before annotation:**
 Unique DNA amplicons are counted across all reads in pass 1. Translation and ANARCI CDR annotation run only once per unique sequence — not once per read — dramatically reducing work on high-depth libraries. ANARCI is called in batches (`--anarci-batch`) to amortise hmmer subprocess overhead.
@@ -99,13 +103,13 @@ Multiple BAM files are processed in parallel worker processes (`--workers`). Def
 | `--min-q` | 10.0 | Minimum mean ONT Q-score |
 | `--min-len` | 300 | Minimum read length (bp) |
 | `--max-len` | 1000 | Maximum read length (bp) |
+| `--min-aa` | 100 | Minimum VHH protein length (aa) |
 | `--cdr-method` | anarci | CDR extraction: `anarci` or `offset` |
+| `--fr1` | CAGGTGCAGCTG | FR1 anchor motif |
+| `--j4` | ACCCAGGTCACC | J4 anchor motif |
+| `--fr-mm` | 2 | Fuzzy mismatch tolerance |
 | `--use-umi` | off | Enable UMI deduplication (Dorado `UX` tag) |
-| `--ref-vhh-start` | 0 | Reference start of VHH amplicon window |
-| `--ref-vhh-end` | 390 | Reference end of VHH amplicon window |
-| `--fr1` | CAGGTGCAGCTG | FR1 motif for fallback search |
-| `--j4` | ACCCAGGTCACC | J4 motif for fallback search |
-| `--fr-mm` | 2 | Fuzzy mismatch tolerance for motif fallback |
+| `--umi-tag` | UX | BAM tag containing the UMI |
 | `--workers` | #BAMs | Parallel BAM worker processes |
 | `--anarci-batch` | 5000 | Proteins per ANARCI batch call |
 
@@ -113,7 +117,7 @@ Multiple BAM files are processed in parallel worker processes (`--workers`). Def
 python bam_extract.py /path/to/bams/ --min-q 12 --workers 10
 ```
 
-The summary table printed at the end shows **CIGAR path** vs **Motif fallback** counts per file. A high motif-fallback rate (>10%) suggests the `--ref-vhh-end` value may need adjusting for your reference.
+The summary table shows **Aln search** vs **Full read fallback** counts per file. A high full-read fallback rate is normal when the IGHV reference contains flanking sequence before FR1 (common with IMGT germlines).
 
 ---
 

@@ -301,16 +301,41 @@ def calculate_enrichment(
     sig_depleted = ((merged["Log2_Enrichment"] <= -log2_cutoff) & (merged["FDR"] < fdr_cutoff)).sum()
     novel        = (merged["Match_Type"] == "novel").sum()
 
+    summary_rows = [
+        ("R2 clusters total",                                       str(len(merged))),
+        ("Exact matches",                                           str((merged["Match_Type"] == "exact").sum())),
+        ("Fuzzy matches",                                           str((merged["Match_Type"] == "fuzzy").sum())),
+        ("Novel (absent in R1)",                                    str(novel)),
+        (f"Enriched (log2≥{log2_cutoff}, FDR<{fdr_cutoff})",  str(sig_enriched)),
+        (f"Depleted (log2≤-{log2_cutoff}, FDR<{fdr_cutoff})", str(sig_depleted)),
+    ]
+
     table = Table(title="Enrichment Summary", show_lines=True)
     table.add_column("Metric",  style="cyan")
     table.add_column("Value",   justify="right")
-    table.add_row("R2 clusters total",      str(len(merged)))
-    table.add_row("Exact matches",          str((merged["Match_Type"] == "exact").sum()))
-    table.add_row("Fuzzy matches",          str((merged["Match_Type"] == "fuzzy").sum()))
-    table.add_row("Novel (absent in R1)",   str(novel))
-    table.add_row(f"Enriched (log2≥{log2_cutoff}, FDR<{fdr_cutoff})",  str(sig_enriched))
-    table.add_row(f"Depleted (log2≤-{log2_cutoff}, FDR<{fdr_cutoff})", str(sig_depleted))
+    for metric, value in summary_rows:
+        table.add_row(metric, value)
     console.print(table)
+
+    # ── Summary log ───────────────────────────────────────────────────────────
+    import datetime
+    log_path = out_dir / f"{stem}_summary.txt"
+    col_w = max(len(m) for m, _ in summary_rows) + 2
+    with open(log_path, "w") as fh:
+        fh.write("Enrichment Summary\n")
+        fh.write("=" * (col_w + 12) + "\n")
+        fh.write(f"Generated : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        fh.write(f"R1 input  : {file_r1}\n")
+        fh.write(f"R2 input  : {file_r2}\n")
+        fh.write(f"min_r2_count : {min_r2_count}\n")
+        fh.write(f"log2_cutoff  : {log2_cutoff}\n")
+        fh.write(f"fdr_cutoff   : {fdr_cutoff}\n")
+        fh.write(f"threshold    : {threshold}\n")
+        fh.write("-" * (col_w + 12) + "\n")
+        for metric, value in summary_rows:
+            fh.write(f"{metric:<{col_w}}{value}\n")
+    console.print(f"[green]✓ Summary log:[/green] {log_path}")
+
     console.print(f"\n[green]✓ Enrichment written to:[/green] {out_dir}/")
 
     return merged

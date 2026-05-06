@@ -10,3 +10,5 @@ build/
 BAM_extract/
 *.bam
 *.bai
+vhh_extract_05052026/
+vhh_extract_05052026.zip

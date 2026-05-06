@@ -25,9 +25,9 @@ pre-aligned to IMGT Vicugna IGHV germlines
                               → *_cluster_consensus.csv
           │
           ▼
-  cluster_enrichment.py       Step 3 — log2 CPM enrichment (R1 vs R2),
+  cluster_enrichment.py       Step 3 — log2 % frequency enrichment (any two rounds),
                               two-tailed binomial test + BH FDR correction
-                              → VHH_enrichment.xlsx + volcano/rank plots
+                              → {sample}_{comparison}.csv + volcano/rank plots + summary log
 ```
 
 Or run all three steps in sequence:
@@ -183,40 +183,91 @@ python cluster_levenshtein.py \
 
 ### `cluster_enrichment.py` — Step 3
 
-Compares Round 1 vs Round 2 cluster consensus files. Computes log2(CPM) enrichment, two-tailed binomial test p-values, and Benjamini-Hochberg FDR correction. Outputs an annotated Excel file, a matching CSV, and volcano and rank-enrichment plots.
+Compares any two selection rounds (R0 vs R1, R0 vs R2, R1 vs R2) using cluster consensus files. Computes log2 % frequency enrichment, two-tailed binomial test p-values, and Benjamini-Hochberg FDR correction. Outputs a named CSV, summary log, and volcano and rank-enrichment plots.
 
-**Statistical approach:** Uses a two-tailed binomial test, which is the correct model for sequencing proportion data where only total reads per round are experimentally fixed (not total reads per cluster). Laplace smoothing `(c1+0.5)/(total_r1+0.5)` gives a well-behaved expected proportion for clusters absent in R1. CPM pseudocount (0.5) is used only for fold-change estimation and is independent of the significance test.
+**Normalisation:** Enrichment is calculated as log2(Freq_R2 / Freq_R1), where `Freq = cluster_count / sum(all cluster counts) × 100`. A fixed pseudocount of 1e-3 is added to each cluster count solely to prevent log(0) for clusters absent in the earlier round — it has negligible effect on any cluster with real counts. Library totals are computed from raw counts before any `--min-r2-count` filtering so the denominator is stable across thresholds.
 
-Accepts `.csv` or `.xlsx` consensus input. Matches clusters by exact CDR3 identity first, falling back to normalised Levenshtein similarity (rapidfuzz, SIMD-accelerated). 1:1 matching is enforced — if multiple R2 clusters fuzzy-match the same R1 cluster, the first (highest-ranked) match wins and the rest are treated as novel, preventing shared-count inflation.
+**Statistical approach:** Two-tailed binomial test — the correct model for sequencing proportion data where only total reads per round are experimentally fixed. Laplace smoothing `(c1+0.5)/(total_r1+0.5)` gives a well-behaved expected proportion for novel clusters. BH FDR correction applied across all tested clusters.
+
+**CDR3 matching:** Exact identity first, falling back to normalised Levenshtein similarity (rapidfuzz, SIMD-accelerated). 1:1 matching enforced — if multiple late-round clusters fuzzy-match the same early-round cluster, the first (highest-ranked) match wins and the rest are treated as novel, preventing shared-count inflation.
+
+**Volcano plot:** Four categories, colour-coded:
+
+| Colour | Category |
+|--------|----------|
+| Green | Enriched AND matched (exact or fuzzy) to early round — labelled with CDR3 |
+| Red | Enriched but novel (absent in early round) |
+| Blue | Depleted (top 5 labelled) |
+| Grey | Not significant |
+
+Accepts `.csv` or `.xlsx` consensus input.
 
 ```bash
 python cluster_enrichment.py \
   R1_cluster_consensus.csv \
   R2_cluster_consensus.csv \
   --output results/ \
-  --min-r2-count 10 \
+  --min-r2-count 50 \
   --log2-cutoff 1.0 \
   --fdr-cutoff 0.05
 ```
 
+**Multi-comparison shell loop** (R0 vs R2, R0 vs R1, R1 vs R2 per sample, with output files named by sample and comparison):
+
+```bash
+for DIR in vhh_extract_05052026/*/; do
+    SAMPLE=$(basename "$DIR")
+    [[ "$SAMPLE" == "BAM_extract" ]] && continue
+
+    R0=$(ls "$DIR"Alpaca*_cluster_consensus.csv 2>/dev/null | head -1)
+    R1=$(ls "$DIR"*-1_vhh_protein_cdr_cluster_consensus.csv 2>/dev/null | head -1)
+    R2=$(ls "$DIR"*-2_vhh_protein_cdr_cluster_consensus.csv 2>/dev/null | head -1)
+
+    [[ -z "$R2" ]] && continue
+
+    run_enrichment() {
+        local early="$1" late="$2" label="$3" outdir="$4"
+        python3 cluster_enrichment.py "$early" "$late" \
+            --output "$outdir" \
+            --min-r2-count 50
+        for f in "$outdir"/VHH_enrichment*; do
+            mv "$f" "${f/VHH_enrichment/${SAMPLE}_${label}}"
+        done
+    }
+
+    [[ -n "$R0" ]]             && run_enrichment "$R0" "$R2" "R0vsR2" "${DIR}enrichment_R0vsR2"
+    [[ -n "$R0" && -n "$R1" ]] && run_enrichment "$R0" "$R1" "R0vsR1" "${DIR}enrichment_R0vsR1"
+    [[ -n "$R1" ]]             && run_enrichment "$R1" "$R2" "R1vsR2" "${DIR}enrichment_R1vsR2"
+done
+```
+
+Output files per comparison (e.g. `h19/enrichment_R0vsR2/`):
+
+| File | Description |
+|------|-------------|
+| `{sample}_{comparison}.csv` | Enrichment table: Freq_R1, Freq_R2, Log2_Enrichment, p-value, FDR |
+| `{sample}_{comparison}_volcano.png` | Volcano plot with matched/novel/depleted colour coding |
+| `{sample}_{comparison}_rank_enrichment.png` | Rank-ordered enrichment bar chart |
+| `{sample}_{comparison}_summary.txt` | Plain-text summary statistics + run parameters |
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `file_r1` | — | Round 1 consensus file (.csv or .xlsx) |
-| `file_r2` | — | Round 2 consensus file (.csv or .xlsx) |
-| `--output` | `.` | Output directory for enrichment CSV and plots |
+| `file_r1` | — | Early round consensus file (.csv or .xlsx) |
+| `file_r2` | — | Late round consensus file (.csv or .xlsx) |
+| `--output` | `.` | Output directory |
 | `--threshold` | 0.85 | Normalised Levenshtein similarity for fuzzy CDR3 matching |
 | `--no-fuzzy` | off | Exact CDR3 matching only |
-| `--log2-cutoff` | 1.0 | log2 enrichment cutoff for volcano |
+| `--log2-cutoff` | 1.0 | log2 enrichment cutoff for volcano significance threshold |
 | `--fdr-cutoff` | 0.05 | FDR significance threshold |
-| `--min-r2-count` | 0 | Exclude R2 clusters with fewer than N reads (reduces multiple-testing burden) |
-| `--entropy-flag` | 1.5 | Shannon entropy above which a cluster is flagged as `heterogeneous` in `Quality_Flag` column |
+| `--min-r2-count` | 0 | Exclude late-round clusters with fewer than N reads |
+| `--entropy-flag` | 1.5 | Shannon entropy above which clusters are flagged as `heterogeneous` |
 
-**Quality_Flag column** (present when `Shannon_Entropy` is in the R2 input):
+**Quality_Flag column** (present when `Shannon_Entropy` is in the late-round input):
 
 | Value | Meaning |
 |-------|---------|
 | `heterogeneous` | Shannon entropy > `--entropy-flag`; cluster contains many divergent CDR3s |
-| `low_depth` | R2 cluster has < 20 total reads; fold change is unreliable |
+| `low_depth` | Late-round cluster has < 20 total reads; fold change unreliable |
 | _(empty)_ | No quality concern |
 
 ---
@@ -253,7 +304,8 @@ python run_pipeline.py \
 | `*_summary.json` | 1 | Per-BAM read fate statistics |
 | `*_clonotypes.csv` | 2 | Per-sequence clonotype assignments + Cluster_Count |
 | `*_cluster_consensus.csv` | 2 | One row per clonotype; Count-weighted consensus + biophysics |
-| `VHH_enrichment.csv` | 3 | Enrichment table: log2, CPM, p-value, FDR |
+| `{sample}_{comparison}.csv` | 3 | Enrichment table: Freq_R1, Freq_R2, Log2_Enrichment, p-value, FDR |
+| `{sample}_{comparison}_summary.txt` | 3 | Plain-text summary statistics + run parameters |
 | `*_volcano.png` | 3 | Volcano plot (log2 enrichment vs −log10 FDR) |
 | `*_rank_enrichment.png` | 3 | Rank-ordered enrichment bar chart |
 

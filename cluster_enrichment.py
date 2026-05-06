@@ -128,33 +128,39 @@ def compute_enrichment(df: pd.DataFrame, min_r2_count: int = 0) -> pd.DataFrame:
 def plot_volcano(df: pd.DataFrame, output_path: Path,
                  log2_threshold: float = 1.0, fdr_threshold: float = 0.05):
     """Volcano plot: log2 enrichment vs -log10 FDR. Dot size = sqrt(R2 count)."""
+    matched  = df["Match_Type"].isin(["exact", "fuzzy"])
     enriched = (df["Log2_Enrichment"] >= log2_threshold) & (df["FDR"] < fdr_threshold)
     depleted = (df["Log2_Enrichment"] <= -log2_threshold) & (df["FDR"] < fdr_threshold)
-    neutral  = ~enriched & ~depleted
+
+    enriched_matched   = enriched &  matched
+    enriched_unmatched = enriched & ~matched
+    neutral            = ~enriched & ~depleted
 
     def _sizes(mask):
         return np.sqrt(df.loc[mask, "Count_R2"].clip(lower=1)).clip(5, 60)
 
     fig, ax = plt.subplots(figsize=(9, 7))
-    ax.scatter(df.loc[neutral,  "Log2_Enrichment"], df.loc[neutral,  "Neg_log10_FDR"],
-               c="grey",   alpha=0.4, s=_sizes(neutral),  label="Not significant")
-    ax.scatter(df.loc[enriched, "Log2_Enrichment"], df.loc[enriched, "Neg_log10_FDR"],
-               c="#d62728", alpha=0.8, s=_sizes(enriched), label=f"Enriched (n={enriched.sum()})")
-    ax.scatter(df.loc[depleted, "Log2_Enrichment"], df.loc[depleted, "Neg_log10_FDR"],
-               c="#1f77b4", alpha=0.8, s=_sizes(depleted), label=f"Depleted (n={depleted.sum()})")
+    ax.scatter(df.loc[neutral,            "Log2_Enrichment"], df.loc[neutral,            "Neg_log10_FDR"],
+               c="grey",    alpha=0.4, s=_sizes(neutral),            label="Not significant")
+    ax.scatter(df.loc[depleted,           "Log2_Enrichment"], df.loc[depleted,           "Neg_log10_FDR"],
+               c="#1f77b4", alpha=0.8, s=_sizes(depleted),           label=f"Depleted (n={depleted.sum()})")
+    ax.scatter(df.loc[enriched_unmatched, "Log2_Enrichment"], df.loc[enriched_unmatched, "Neg_log10_FDR"],
+               c="#d62728", alpha=0.8, s=_sizes(enriched_unmatched), label=f"Enriched – novel (n={enriched_unmatched.sum()})")
+    ax.scatter(df.loc[enriched_matched,   "Log2_Enrichment"], df.loc[enriched_matched,   "Neg_log10_FDR"],
+               c="#2ca02c", alpha=0.9, s=_sizes(enriched_matched),   label=f"Enriched – matched (n={enriched_matched.sum()})")
 
     ax.axvline(log2_threshold,  color="red",   linestyle="--", linewidth=0.8, alpha=0.7)
     ax.axvline(-log2_threshold, color="blue",  linestyle="--", linewidth=0.8, alpha=0.7)
-    ax.axhline(-np.log10(fdr_threshold), color="green", linestyle="--",
+    ax.axhline(-np.log10(fdr_threshold), color="black", linestyle="--",
                linewidth=0.8, alpha=0.7, label=f"FDR={fdr_threshold}")
 
-    # Label top 10 enriched and top 5 depleted
-    for sub_df in [df[enriched].nlargest(10, "Log2_Enrichment"),
-                   df[depleted].nsmallest(5, "Log2_Enrichment")]:
+    # Label all enriched+matched, then top depleted
+    for sub_df, ha in [(df[enriched_matched], "left"),
+                       (df[depleted].nsmallest(5, "Log2_Enrichment"), "right")]:
         for _, row in sub_df.iterrows():
             ax.annotate(str(row.get("CDR3", ""))[:12],
                         (row["Log2_Enrichment"], row["Neg_log10_FDR"]),
-                        fontsize=6, ha="left", va="bottom", alpha=0.8)
+                        fontsize=6, ha=ha, va="bottom", alpha=0.9)
 
     ax.set_xlabel("log₂(Enrichment)", fontsize=12)
     ax.set_ylabel("-log₁₀(FDR)", fontsize=12)

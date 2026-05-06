@@ -85,18 +85,13 @@ def compute_enrichment(df: pd.DataFrame, min_r2_count: int = 0) -> pd.DataFrame:
     """
     Add enrichment metrics using the binomial test.
 
-    The binomial test is correct for sequencing data: only total reads per
-    round are experimentally fixed (row totals), not total reads per cluster
-    (column totals). Fisher's exact conditions on both margins and is therefore
-    misspecified here.
-
-    Laplace smoothing ((c1+0.5)/(total_r1+0.5)) gives a sensible expected
-    proportion for novel clusters (Count_R1=0) and avoids degenerate p=0.
-
-    Library totals are computed before min_r2_count filtering so the reference
-    denominator is stable across thresholds.
+    Normalisation: % frequency = cluster_count / sum(all cluster counts).
+    A fixed pseudocount of 1e-3 is added solely to prevent log(0); it has
+    negligible effect on any cluster with real counts. Library totals are
+    computed from raw counts before min_r2_count filtering so the denominator
+    is stable across thresholds.
     """
-    pseudocount = 0.5
+    pseudocount = 1e-3
 
     # Stable library totals — computed before filtering
     total_r1_int = int(df["Count_R1"].sum())
@@ -105,14 +100,9 @@ def compute_enrichment(df: pd.DataFrame, min_r2_count: int = 0) -> pd.DataFrame:
     if min_r2_count > 0:
         df = df[df["Count_R2"] >= min_r2_count].copy().reset_index(drop=True)
 
-    # CPM: pseudocount prevents log(0); uses the same stable totals
-    n = len(df)
-    total_r1_cpm = total_r1_int + pseudocount * n
-    total_r2_cpm = total_r2_int + pseudocount * n
-
-    df["CPM_R1"] = (df["Count_R1"] + pseudocount) / total_r1_cpm * 1e6
-    df["CPM_R2"] = (df["Count_R2"] + pseudocount) / total_r2_cpm * 1e6
-    df["Log2_Enrichment"] = np.log2(df["CPM_R2"] / df["CPM_R1"])
+    df["Freq_R1"] = (df["Count_R1"] + pseudocount) / total_r1_int * 100
+    df["Freq_R2"] = (df["Count_R2"] + pseudocount) / total_r2_int * 100
+    df["Log2_Enrichment"] = np.log2(df["Freq_R2"] / df["Freq_R1"])
 
     # Two-tailed binomial test: detects both enrichment and depletion
     pvals = []

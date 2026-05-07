@@ -214,6 +214,7 @@ def calculate_enrichment(
     fdr_cutoff:   float = 0.05,
     min_r2_count: int   = 0,
     entropy_flag: float = 1.5,
+    novel_cutoff: int   = 300,
 ) -> pd.DataFrame:
 
     df_r1 = _read_consensus(file_r1)
@@ -288,6 +289,25 @@ def calculate_enrichment(
     merged.to_csv(csv_path, index=False)
     console.print(f"[green]✓ Enrichment CSV:[/green] {csv_path}")
 
+    known_enriched = merged[
+        (merged["Log2_Enrichment"] >= log2_cutoff) &
+        (merged["FDR"] < fdr_cutoff) &
+        (merged["Match_Type"].isin(["exact", "fuzzy"]))
+    ]
+    known_path = out_dir / f"{stem}_known_enriched.csv"
+    known_enriched.to_csv(known_path, index=False)
+    console.print(f"[green]✓ Known enriched CSV:[/green] {known_path} ({len(known_enriched)} clusters)")
+
+    novel_enriched = merged[
+        (merged["Log2_Enrichment"] >= log2_cutoff) &
+        (merged["FDR"] < fdr_cutoff) &
+        (merged["Match_Type"] == "novel") &
+        (merged["Count_R2"] >= novel_cutoff)
+    ]
+    novel_path = out_dir / f"{stem}_novel_enriched.csv"
+    novel_enriched.to_csv(novel_path, index=False)
+    console.print(f"[green]✓ Novel enriched CSV:[/green] {novel_path} ({len(novel_enriched)} clusters)")
+
     plot_volcano(merged, out_dir / f"{stem}_volcano.png",
                  log2_threshold=log2_cutoff, fdr_threshold=fdr_cutoff)
     plot_rank_enrichment(merged, out_dir / f"{stem}_rank_enrichment.png")
@@ -302,8 +322,10 @@ def calculate_enrichment(
         ("Exact matches",                                           str((merged["Match_Type"] == "exact").sum())),
         ("Fuzzy matches",                                           str((merged["Match_Type"] == "fuzzy").sum())),
         ("Novel (absent in R1)",                                    str(novel)),
-        (f"Enriched (log2≥{log2_cutoff}, FDR<{fdr_cutoff})",  str(sig_enriched)),
-        (f"Depleted (log2≤-{log2_cutoff}, FDR<{fdr_cutoff})", str(sig_depleted)),
+        (f"Enriched (log2≥{log2_cutoff}, FDR<{fdr_cutoff})",          str(sig_enriched)),
+        (f"Enriched + matched (known_enriched.csv)",                    str(len(known_enriched))),
+        (f"Enriched + novel ≥{novel_cutoff} reads (novel_enriched.csv)", str(len(novel_enriched))),
+        (f"Depleted (log2≤-{log2_cutoff}, FDR<{fdr_cutoff})",         str(sig_depleted)),
     ]
 
     table = Table(title="Enrichment Summary", show_lines=True)
@@ -362,6 +384,9 @@ def main():
     parser.add_argument("--entropy-flag", type=float, default=1.5,
                         help="Shannon entropy above which clusters are flagged as heterogeneous "
                              "(default: 1.5 bits; requires Shannon_Entropy column in R2 input)")
+    parser.add_argument("--novel-cutoff", type=int, default=300,
+                        help="Min R2 Count for a novel (unmatched) enriched cluster to appear in "
+                             "*_novel_enriched.csv (default: 300)")
     args = parser.parse_args()
 
     if not os.path.exists(args.file_r1) or not os.path.exists(args.file_r2):
@@ -377,6 +402,7 @@ def main():
         fdr_cutoff=args.fdr_cutoff,
         min_r2_count=args.min_r2_count,
         entropy_flag=args.entropy_flag,
+        novel_cutoff=args.novel_cutoff,
     )
 
 

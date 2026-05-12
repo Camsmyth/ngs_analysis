@@ -12,6 +12,8 @@ High-throughput design for millions of reads across many BAM files:
   • Parallel BAM processing — one worker process per file (--workers)
   • Fast Q-score via numpy vectorisation; fast RC via C translation table
   • Motif-search fallback for reads that don't fully cover the reference window
+  • Frame integrity validation — rejects ONT indel-induced frameshifts via
+    inter-anchor length parity (modulo-3) and canonical FR4 motif validation
 """
 
 import os
@@ -88,6 +90,12 @@ LIABILITY_PATTERNS = {
 }
 
 VHH_START_MOTIFS = ("QVQ", "VQL", "QLQ", "EVQ", "DVQ")
+
+# Canonical VHH FR4 motif. Real FR4 is WGQGT[Q/L]VTVSS with minor variation;
+# frameshifted mistranslations (typically proline-rich) cannot satisfy this
+# pattern. Used as a post-translation belt-and-braces filter against
+# compensating indels that survive the modulo-3 frame check.
+FR4_RE = re.compile(r"W[GAS][QKR]GT[QLAVIM]VT[VIA]SS")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FAST UTILITIES
@@ -300,8 +308,13 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
                via FR1/J4 motif search on the alignment-stripped region
                (soft-clip-free, reference-oriented), falling back to full
                read search for unmapped or partial reads.
+               Frame integrity is enforced here: FR1 (QVQL) and J4 (TQVT)
+               anchors are both codon-aligned, so any in-frame amplicon must
+               have length divisible by 3. Frameshift indels are rejected
+               before deduplication.
                Accumulate unique DNA counts — no translation yet.
       Pass 2 — Translate unique DNA sequences only; aggregate by protein.
+               Validate canonical FR4 motif to catch compensating indels.
       Pass 3 — Batch ANARCI on unique proteins; assemble output tables.
     """
     bam_out_dir = output_dir / bam_path.stem
@@ -378,6 +391,17 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
                 continue
 
             amplicon, source = result
+
+            # Frame integrity check: FR1 motif (CAGGTGCAGCTG = QVQL) and J4
+            # motif (ACCCAGGTCACC = TQVT) are both codon-aligned to the VHH
+            # reading frame. A valid in-frame amplicon must therefore have
+            # length divisible by 3. Any single or double indel between
+            # anchors breaks this — the primary filter against ONT
+            # indel-induced frameshifts that pass anchor search.
+            if len(amplicon) % 3 != 0:
+                stats["frameshift_indel"] += 1
+                continue
+
             stats["framework_found"] += 1
             stats[f"extracted_{source}"] += 1  # "aligned" | "+" | "-"
             dna_counts[amplicon] += 1
@@ -397,6 +421,14 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
             continue
         if prot.count("*") > cfg["MAX_INTERNAL_STOPS"]:
             stats["stop_codon"] += 1
+            dna_to_prot[dna] = None
+            continue
+        # FR4 motif validator. The modulo-3 check in Pass 1 catches
+        # single/double indels; this catches the rare compensating-indel
+        # case (+1 then -1 within the same CDR3) that preserves overall
+        # length parity but still scrambles the frame locally.
+        if not FR4_RE.search(prot[-25:]):
+            stats["bad_fr4"] += 1
             dna_to_prot[dna] = None
             continue
         dna_to_prot[dna] = prot
@@ -587,6 +619,8 @@ def main():
     table.add_column("Unmapped",          justify="right")
     table.add_column("Aln search",        justify="right")
     table.add_column("Full read fallback",justify="right")
+    table.add_column("Frameshift",        justify="right")
+    table.add_column("Bad FR4",           justify="right")
     table.add_column("Extracted reads",   justify="right")
     table.add_column("Unique proteins",   justify="right")
     table.add_column("Median Q",          justify="right")
@@ -601,6 +635,8 @@ def main():
             str(st.get("unmapped", 0)),
             str(aln_found),
             str(full_found),
+            str(st.get("frameshift_indel", 0)),
+            str(st.get("bad_fr4", 0)),
             str(st.get("extracted", 0)),
             str(s["unique_proteins"]),
             f"{s['median_qscore']:.1f}" if s["median_qscore"] else "N/A",

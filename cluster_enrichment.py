@@ -210,11 +210,11 @@ def calculate_enrichment(
     output_dir:   str   = ".",
     threshold:    float = 0.85,
     use_fuzzy:    bool  = True,
-    log2_cutoff:  float = 1.0,
+    log2_cutoff:  float = 0.7,
     fdr_cutoff:   float = 0.05,
-    min_r2_count: int   = 0,
+    min_r2_count: int   = 100,
     entropy_flag: float = 1.5,
-    novel_cutoff: int   = 300,
+    novel_cutoff: int   = 250,
 ) -> pd.DataFrame:
 
     df_r1 = _read_consensus(file_r1)
@@ -375,8 +375,8 @@ def main():
                         help="Normalised Levenshtein similarity threshold for fuzzy CDR3 matching (default: 0.85)")
     parser.add_argument("--no-fuzzy", action="store_true",
                         help="Disable fuzzy matching; exact CDR3 only")
-    parser.add_argument("--log2-cutoff", type=float, default=1.0,
-                        help="Log2 enrichment cutoff for volcano (default: 1.0)")
+    parser.add_argument("--log2-cutoff", type=float, default=0.7,
+                        help="Log2 enrichment cutoff for volcano (default: 0.7)")
     parser.add_argument("--fdr-cutoff",  type=float, default=0.05,
                         help="FDR cutoff for significance (default: 0.05)")
     parser.add_argument("--min-r2-count", type=int, default=0,

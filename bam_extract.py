@@ -12,8 +12,8 @@ High-throughput design for millions of reads across many BAM files:
   • Parallel BAM processing — one worker process per file (--workers)
   • Fast Q-score via numpy vectorisation; fast RC via C translation table
   • Motif-search fallback for reads that don't fully cover the reference window
-  • Frame integrity validation — rejects ONT indel-induced frameshifts via
-    inter-anchor length parity (modulo-3) and canonical FR4 motif validation
+  • FR4 motif validation — rejects frameshifted translations that produce
+    proline-rich C-termini instead of the canonical WGQGT VHH FR4
 """
 
 import os
@@ -91,11 +91,13 @@ LIABILITY_PATTERNS = {
 
 VHH_START_MOTIFS = ("QVQ", "VQL", "QLQ", "EVQ", "DVQ")
 
-# Canonical VHH FR4 motif. Real FR4 is WGQGT[Q/L]VTVSS with minor variation;
-# frameshifted mistranslations (typically proline-rich) cannot satisfy this
-# pattern. Used as a post-translation belt-and-braces filter against
-# compensating indels that survive the modulo-3 frame check.
-FR4_RE = re.compile(r"W[GAS][QKR]GT[QLAVIM]VT[VIA]SS")
+# Canonical VHH FR4 motif. The amplicon ends at the J4 anchor (TQVT), so the
+# translated C-terminus is WG?GTXVT — the downstream VTVSS tail is not
+# captured. Position after WG is variable (Q/K/R/P/N/E/G/H all observed in
+# alpaca VHHs); the structural WG..GT.VT scaffold is conserved and cannot be
+# satisfied by frameshift garbage (which lacks W entirely or has ARGPRS/PGDPGH
+# artifacts).
+FR4_RE = re.compile(r"WG[QKRPNEGH]GT[QLAVIM]VT")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FAST UTILITIES
@@ -308,13 +310,10 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
                via FR1/J4 motif search on the alignment-stripped region
                (soft-clip-free, reference-oriented), falling back to full
                read search for unmapped or partial reads.
-               Frame integrity is enforced here: FR1 (QVQL) and J4 (TQVT)
-               anchors are both codon-aligned, so any in-frame amplicon must
-               have length divisible by 3. Frameshift indels are rejected
-               before deduplication.
                Accumulate unique DNA counts — no translation yet.
       Pass 2 — Translate unique DNA sequences only; aggregate by protein.
-               Validate canonical FR4 motif to catch compensating indels.
+               Validate canonical FR4 motif to catch frameshifted reads
+               whose C-terminus deviates from canonical VHH FR4.
       Pass 3 — Batch ANARCI on unique proteins; assemble output tables.
     """
     bam_out_dir = output_dir / bam_path.stem
@@ -356,6 +355,10 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
                          desc=stem[:30], unit="reads", leave=False):
             stats["total"] += 1
 
+            if read.is_secondary or read.is_supplementary:
+                stats["non_primary"] += 1
+                continue
+
             if read.is_unmapped or read.query_sequence is None:
                 stats["unmapped"] += 1
                 continue
@@ -391,17 +394,6 @@ def process_bam(bam_path: Path, output_dir: Path, config: dict) -> dict:
                 continue
 
             amplicon, source = result
-
-            # Frame integrity check: FR1 motif (CAGGTGCAGCTG = QVQL) and J4
-            # motif (ACCCAGGTCACC = TQVT) are both codon-aligned to the VHH
-            # reading frame. A valid in-frame amplicon must therefore have
-            # length divisible by 3. Any single or double indel between
-            # anchors breaks this — the primary filter against ONT
-            # indel-induced frameshifts that pass anchor search.
-            if len(amplicon) % 3 != 0:
-                stats["frameshift_indel"] += 1
-                continue
-
             stats["framework_found"] += 1
             stats[f"extracted_{source}"] += 1  # "aligned" | "+" | "-"
             dna_counts[amplicon] += 1
@@ -616,10 +608,10 @@ def main():
     table = Table(title="BAM Extraction Summary", show_lines=True)
     table.add_column("File",              style="cyan", no_wrap=True)
     table.add_column("Total",             justify="right")
+    table.add_column("Non-primary",       justify="right")
     table.add_column("Unmapped",          justify="right")
     table.add_column("Aln search",        justify="right")
     table.add_column("Full read fallback",justify="right")
-    table.add_column("Frameshift",        justify="right")
     table.add_column("Bad FR4",           justify="right")
     table.add_column("Extracted reads",   justify="right")
     table.add_column("Unique proteins",   justify="right")
@@ -632,10 +624,10 @@ def main():
         table.add_row(
             s["file"],
             str(st.get("total", 0)),
+            str(st.get("non_primary", 0)),
             str(st.get("unmapped", 0)),
             str(aln_found),
             str(full_found),
-            str(st.get("frameshift_indel", 0)),
             str(st.get("bad_fr4", 0)),
             str(st.get("extracted", 0)),
             str(s["unique_proteins"]),

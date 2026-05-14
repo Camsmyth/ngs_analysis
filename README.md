@@ -215,7 +215,7 @@ python cluster_enrichment.py \
 **Multi-comparison shell loop** (R0 vs R2, R0 vs R1, R1 vs R2 per sample, with output files named by sample and comparison):
 
 ```bash
-for DIR in vhh_extract_05052026/*/; do
+for DIR in PATH_TO_PARENT/*/; do
     SAMPLE=$(basename "$DIR")
     [[ "$SAMPLE" == "BAM_extract" ]] && continue
 

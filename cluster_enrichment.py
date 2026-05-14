@@ -214,7 +214,7 @@ def calculate_enrichment(
     fdr_cutoff:   float = 0.05,
     min_r2_count: int   = 100,
     entropy_flag: float = 1.5,
-    novel_cutoff: int   = 250,
+    novel_cutoff: int   = 25,
 ) -> pd.DataFrame:
 
     df_r1 = _read_consensus(file_r1)
@@ -384,9 +384,9 @@ def main():
     parser.add_argument("--entropy-flag", type=float, default=1.5,
                         help="Shannon entropy above which clusters are flagged as heterogeneous "
                              "(default: 1.5 bits; requires Shannon_Entropy column in R2 input)")
-    parser.add_argument("--novel-cutoff", type=int, default=300,
+    parser.add_argument("--novel-cutoff", type=int, default=25,
                         help="Min R2 Count for a novel (unmatched) enriched cluster to appear in "
-                             "*_novel_enriched.csv (default: 300)")
+                             "*_novel_enriched.csv (default: 25)")
     args = parser.parse_args()
 
     if not os.path.exists(args.file_r1) or not os.path.exists(args.file_r2):

@@ -185,9 +185,9 @@ python cluster_levenshtein.py \
 
 Compares any two selection rounds (R0 vs R1, R0 vs R2, R1 vs R2) using cluster consensus files. Computes log2 % frequency enrichment, two-tailed binomial test p-values, and Benjamini-Hochberg FDR correction. Outputs a named CSV, summary log, and volcano and rank-enrichment plots.
 
-**Normalisation:** Enrichment is calculated as log2(Freq_R2 / Freq_R1), where `Freq = cluster_count / sum(all cluster counts) × 100`. A fixed pseudocount of 1e-3 is added to each cluster count solely to prevent log(0) for clusters absent in the earlier round — it has negligible effect on any cluster with real counts. Library totals are computed from raw counts before any `--min-r2-count` filtering so the denominator is stable across thresholds.
+**Normalisation:** Enrichment is calculated as log2(Freq_R2 / Freq_R1), where `Freq = cluster_count / sum(all cluster counts in that round) × 100`. Library totals are taken directly from the original per-round consensus files — **not** from the merged table — so that unmatched early-round clusters are correctly included in the R1 denominator. A fixed pseudocount of 1e-3 is added to each cluster count solely to prevent log(0) for clusters absent in the earlier round; it has negligible effect on any cluster with real counts. Totals are captured before any `--min-r2-count` filtering so the denominator is stable across thresholds.
 
-**Statistical approach:** Two-tailed binomial test — the correct model for sequencing proportion data where only total reads per round are experimentally fixed. Laplace smoothing `(c1+0.5)/(total_r1+0.5)` gives a well-behaved expected proportion for novel clusters. BH FDR correction applied across all tested clusters.
+**Statistical approach:** Two-tailed binomial test — the correct model for sequencing proportion data where only total reads per round are experimentally fixed. The expected proportion uses the same library-total denominator as the frequency calculation. BH FDR correction applied across all tested clusters.
 
 **CDR3 matching:** Exact identity first, falling back to normalised Levenshtein similarity (rapidfuzz, SIMD-accelerated). 1:1 matching enforced — if multiple late-round clusters fuzzy-match the same early-round cluster, the first (highest-ranked) match wins and the rest are treated as novel, preventing shared-count inflation.
 

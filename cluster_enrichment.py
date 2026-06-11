@@ -81,21 +81,24 @@ def match_cdr3(
 # STATISTICS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_enrichment(df: pd.DataFrame, min_r2_count: int = 0) -> pd.DataFrame:
+def compute_enrichment(df: pd.DataFrame, min_r2_count: int = 0,
+                       total_r1: int = 0, total_r2: int = 0) -> pd.DataFrame:
     """
     Add enrichment metrics using the binomial test.
 
     Normalisation: % frequency = cluster_count / sum(all cluster counts).
     A fixed pseudocount of 1e-3 is added solely to prevent log(0); it has
-    negligible effect on any cluster with real counts. Library totals are
-    computed from raw counts before min_r2_count filtering so the denominator
-    is stable across thresholds.
+    negligible effect on any cluster with real counts. Library totals must
+    reflect all clusters in each original round file, not just the matched
+    subset in the merged table — pass them explicitly via total_r1/total_r2.
     """
     pseudocount = 1e-3
 
-    # Stable library totals — computed before filtering
-    total_r1_int = int(df["Count_R1"].sum())
-    total_r2_int = int(df["Count_R2"].sum())
+    # Use caller-supplied totals (from original per-round files) so that
+    # unmatched R1 clusters are included in the denominator.  Fall back to
+    # summing the merged table only when called without explicit totals.
+    total_r1_int = total_r1 if total_r1 > 0 else int(df["Count_R1"].sum())
+    total_r2_int = total_r2 if total_r2 > 0 else int(df["Count_R2"].sum())
 
     if min_r2_count > 0:
         df = df[df["Count_R2"] >= min_r2_count].copy().reset_index(drop=True)
@@ -231,6 +234,9 @@ def calculate_enrichment(
 
     console.print(f"  R1 clusters: {len(df_r1):,}  |  R2 clusters: {len(df_r2):,}")
 
+    total_r1 = int(df_r1["Cluster_Count"].sum())
+    total_r2 = int(df_r2["Cluster_Count"].sum())
+
     lookup_r1 = build_exact_lookup(df_r1, "CDR3")
     seqs_r1   = list(lookup_r1.keys())
 
@@ -271,7 +277,8 @@ def calculate_enrichment(
         rows.append(combined)
 
     merged = pd.DataFrame(rows)
-    merged = compute_enrichment(merged, min_r2_count=min_r2_count)
+    merged = compute_enrichment(merged, min_r2_count=min_r2_count,
+                                total_r1=total_r1, total_r2=total_r2)
 
     # ── Shannon entropy quality flag ──────────────────────────────────────────
     if "Shannon_Entropy_R2" in merged.columns:
